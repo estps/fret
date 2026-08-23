@@ -1,16 +1,11 @@
--- CC TV - Android TV style launcher + buffered streaming cinema
--- PC: python prepare.py videofile.mp4   &&   python3 -m http.server 8080
--- Tunnel: ssh -p 443 -o StrictHostKeyChecking=no free.pinggy.io -R0:localhost:8080
 
--- Paste your current pinggy https URL here (no trailing slash):
 local BASE = "https://simple-greene-freight-back.trycloudflare.com"
 
-local PART_LOW = 4000000      -- refill below this much buffered-ahead
-local PREFILL = 7500000       -- buffer this much before pressing play
+local PART_LOW = 4000000
+local PREFILL = 7500000
 
--- ---------- persisted settings ----------
 local SETTINGS_FILE = ".cctv_settings"
-local DELAY_MS = 0            -- +audio later / -audio earlier
+local DELAY_MS = 0
 if fs.exists(SETTINGS_FILE) then
     local f = fs.open(SETTINGS_FILE, "r")
     DELAY_MS = tonumber(f.readLine()) or 0
@@ -22,22 +17,18 @@ local function saveDelay()
     f.close()
 end
 
-local function urlencode(s)   -- names may contain spaces / brackets etc.
+local function urlencode(s)
     return s:gsub("[^%w%-_%.~]", function(c)
         return ("%%%02X"):format(string.byte(c))
     end)
 end
 
--- ---------- monitor ----------
 local mon = peripheral.find("monitor")
 if not mon then error("No monitor attached", 0) end
 mon.setTextScale(0.5)
-mon.setBackgroundColour(colours.black)
-mon.clear()
 
 local sp = peripheral.find("speaker")
 
--- remember stock palette so menus look right after a movie recoloured it
 local savedPal = {}
 for i = 0, 15 do savedPal[i + 1] = { mon.getPaletteColour(2 ^ i) } end
 local function resetPalette()
@@ -46,6 +37,14 @@ local function resetPalette()
     end
 end
 resetPalette()
+
+local MW, MH = mon.getSize()
+
+local function clockStr()
+    local ok, s = pcall(textutils.formatTime, os.time(), false)
+    if ok and s then return s end
+    return ""
+end
 
 local function fetchMovies()
     local found = {}
@@ -57,7 +56,7 @@ local function fetchMovies()
             found[#found + 1] = line
         end
     end
-    if #found == 0 then   -- offline fallback: previously cached metas
+    if #found == 0 then
         for _, f in ipairs(fs.list("")) do
             local n = f:match("^(.+)%.meta$")
             if n and #n > 0 then found[#found + 1] = n end
@@ -66,66 +65,93 @@ local function fetchMovies()
     return found
 end
 
--- ---------- home menu (android tv cards) ----------
-local CARD_W, CARD_H, GAP = 19, 7, 2
+local CARD_W, CARD_H, GAP = 19, 9, 2
+local HEADER_ROWS = 4
+
+local function drawCard(it, cx, cy, selected)
+    mon.setBackgroundColour(selected and colours.blue or colours.grey)
+    mon.setTextColour(selected and colours.white or colours.lightGrey)
+    for r = 0, CARD_H - 1 do
+        mon.setCursorPos(cx, cy + r)
+        mon.write(string.rep(" ", CARD_W))
+    end
+    local isMovie = it.kind == "movie"
+    mon.setBackgroundColour(selected and (isMovie and colours.lime or colours.orange) or colours.black)
+    mon.setTextColour(selected and colours.black or (isMovie and colours.lime or colours.orange))
+    for r = 0, 2 do
+        mon.setCursorPos(cx + 1, cy + 1 + r)
+        mon.write("   ")
+    end
+    mon.setCursorPos(cx + 1, cy + 1)
+    mon.write(isMovie and "\\|" or "\\7/")
+
+    mon.setTextColour(selected and colours.white or colours.lightGrey)
+    local t1 = it.label:sub(1, CARD_W - 6)
+    local t2 = #it.label > CARD_W - 6 and it.label:sub(CARD_W - 5, CARD_W * 2 - 11) or ""
+    mon.setCursorPos(cx + 5, cy + 1)
+    mon.write(t1)
+    if t2 ~= "" then
+        mon.setCursorPos(cx + 5, cy + 2)
+        mon.write(t2)
+    end
+
+    if selected then
+        mon.setBackgroundColour(colours.yellow)
+        mon.setCursorPos(cx + 1, cy + CARD_H - 2)
+        mon.write(string.rep(" ", CARD_W - 2))
+    else
+        mon.setTextColour(colours.lightGrey)
+        mon.setCursorPos(cx + 1, cy + CARD_H - 3)
+        mon.write(isMovie and "movie" or "settings")
+    end
+    mon.setBackgroundColour(colours.black)
+end
 
 local function homeMenu(movies)
-    local mw, mh = mon.getSize()
     local items = {}
     for _, m in ipairs(movies) do items[#items + 1] = { label = m, kind = "movie" } end
     items[#items + 1] = { label = "Settings", kind = "settings" }
-    local fit = math.max(1, math.floor((mw - 2) / (CARD_W + GAP)))
+    local fit = math.max(1, math.floor((MW - 2) / (CARD_W + GAP)))
     local sel, scroll = 1, 1
+    local cardsY = HEADER_ROWS + 1
 
-    local function draw()
+    local function drawChrome()
         mon.setBackgroundColour(colours.black)
-        mon.setTextColour(colours.white)
         mon.clear()
-        mon.setTextColour(colours.yellow)
+        mon.setTextColour(colours.lime)
         mon.setCursorPos(2, 1)
-        mon.write("CC TV")
+        mon.write("\\127")
+        mon.setTextColour(colours.white)
+        mon.write(" CC TV")
         mon.setTextColour(colours.lightGrey)
+        local c = clockStr()
+        mon.setCursorPos(math.max(1, MW - #c), 1)
+        mon.write(c)
+        mon.setTextColour(colours.grey)
         mon.setCursorPos(2, 2)
-        mon.write(string.rep("-", math.min(mw - 3, 44)))
+        mon.write(string.rep("\\127", MW - 2))
+        mon.setTextColour(colours.lightGrey)
+        mon.setCursorPos(2, 3)
+        mon.write("YOUR MOVIES")
+        mon.setBackgroundColour(colours.grey)
+        mon.setTextColour(colours.white)
+        mon.setCursorPos(1, MH)
+        mon.write(string.rep(" ", MW))
+        mon.setCursorPos(2, MH)
+        mon.write("<> move   Enter open   " .. tostring(#items) .. " items")
+        mon.setBackgroundColour(colours.black)
+    end
+
+    drawChrome()
+    while true do
         if sel < scroll then scroll = sel end
         if sel > scroll + fit - 1 then scroll = sel - fit + 1 end
-        local cy = math.floor(mh / 2) - math.floor(CARD_H / 2)
         for k = 0, fit - 1 do
             local idx = scroll + k
             local it = items[idx]
             if not it then break end
-            local cx = 2 + k * (CARD_W + GAP)
-            local selected = idx == sel
-            mon.setBackgroundColour(selected and colours.blue or colours.grey)
-            mon.setTextColour(selected and colours.white or colours.lightGrey)
-            for r = 0, CARD_H - 1 do
-                mon.setCursorPos(cx, cy + r)
-                mon.write(string.rep(" ", CARD_W))
-            end
-            local tag = it.kind == "settings" and "ADJUST" or "PLAY"
-            local icon = it.kind == "settings" and "[gear]" or "[film]"
-            mon.setTextColour(selected and colours.yellow or colours.white)
-            mon.setCursorPos(cx + 1, cy + 1)
-            mon.write(icon)
-            mon.setTextColour(selected and colours.white or colours.lightGrey)
-            mon.setCursorPos(cx + 1, cy + 3)
-            mon.write(it.label:sub(1, CARD_W - 2))
-            if #it.label > CARD_W - 2 then
-                mon.setCursorPos(cx + 1, cy + 4)
-                mon.write(it.label:sub(CARD_W - 1, CARD_W * 2 - 4))
-            end
-            mon.setTextColour(selected and colours.lime or colours.black)
-            mon.setCursorPos(cx + 1, cy + CARD_H - 2)
-            mon.write("> " .. tag)
-            mon.setBackgroundColour(colours.black)
+            drawCard(it, 2 + k * (CARD_W + GAP), cardsY, idx == sel)
         end
-        mon.setTextColour(colours.lightGrey)
-        mon.setCursorPos(2, mh)
-        mon.write("<> move  [Enter] select  " .. tostring(#items) .. " items")
-    end
-
-    while true do
-        draw()
         local _, key = os.pullEvent("key")
         if key == keys.right and sel < #items then sel = sel + 1 end
         if key == keys.left and sel > 1 then sel = sel - 1 end
@@ -135,59 +161,87 @@ local function homeMenu(movies)
     end
 end
 
--- ---------- settings: bouncing ball audio delay ----------
+local function box(x0, y0, w, h, borderColour)
+    mon.setTextColour(borderColour or colours.grey)
+    mon.setBackgroundColour(colours.black)
+    mon.setCursorPos(x0, y0)
+    mon.write("+" .. string.rep("-", w - 2) .. "+")
+    for r = 1, h - 2 do
+        mon.setCursorPos(x0, y0 + r)
+        mon.write("|" .. string.rep(" ", w - 2) .. "|")
+    end
+    mon.setCursorPos(x0, y0 + h - 1)
+    mon.write("+" .. string.rep("-", w - 2) .. "+")
+end
+
 local function settingsScreen()
-    local mw, mh = mon.getSize()
-    local PERIOD = 1.0           -- seconds per crossing
-    local railY = math.floor(mh / 2) + 1
-    local span = math.max(6, mw - 12)
+    local PERIOD = 1.0
+    local pw = math.min(MW - 4, 64)
+    local ph = 13
+    local px = math.max(2, math.floor((MW - pw) / 2))
+    local py = math.max(2, math.floor((MH - ph) / 2))
+
+    mon.setBackgroundColour(colours.black)
+    mon.clear()
+    box(px, py, pw, ph, colours.blue)
+    mon.setTextColour(colours.yellow)
+    mon.setBackgroundColour(colours.black)
+    mon.setCursorPos(px + 2, py)
+    mon.write(" AUDIO SYNC ")
+
+    local valueY, railY, noteY = py + 3, py + 6, py + 8
 
     local function drawValue()
-        local dv = ("Audio delay: %+.1fs"):format(DELAY_MS / 1000)
+        local dv = ("Audio delay: %+.1f s"):format(DELAY_MS / 1000)
         mon.setTextColour(colours.white)
-        mon.setBackgroundColour(colours.black)
-        mon.setCursorPos(2, 3)
-        mon.write(dv .. string.rep(" ", 6))
+        mon.setCursorPos(px + math.floor((pw - #dv) / 2), valueY)
+        mon.write(dv .. string.rep(" ", 4))
         mon.setTextColour(colours.lightBlue)
-        mon.setCursorPos(2, 4)
-        mon.write("line up the click with the bounce")
+        mon.setCursorPos(px + 2, noteY)
+        mon.write("align the click with each bounce")
     end
 
-    local function drawFrame()
+    local function drawRail()
+        local rw = pw - 12
         mon.setBackgroundColour(colours.black)
-        mon.setTextColour(colours.white)
-        mon.clear()
-        mon.setTextColour(colours.yellow)
-        mon.setCursorPos(2, 1)
-        mon.write("Settings - Audio Sync")
-        drawValue()
+        mon.setCursorPos(px + 3, railY)
+        mon.write(" ")
         mon.setBackgroundColour(colours.grey)
-        mon.setCursorPos(5, railY)
-        mon.write(string.rep(" ", span))
-        mon.setBackgroundColour(colours.black)
-        mon.setTextColour(colours.lightGrey)
-        mon.setCursorPos(2, mh)
-        mon.write("<> delay 0.1s   [Enter] back")
-    end
-
-    local function drawBall(frac)
-        mon.setBackgroundColour(colours.grey)
-        mon.setCursorPos(6, railY)
-        mon.write(string.rep(" ", span - 2))
-        mon.setBackgroundColour(colours.red)
-        mon.setCursorPos(6 + math.floor((span - 2) * frac), railY)
+        mon.setCursorPos(px + 4, railY)
+        mon.write(string.rep(" ", rw))
+        mon.setBackgroundColour(colours.lightGrey)
+        mon.setCursorPos(px + 3, railY)
+        mon.write(" ")
+        mon.setCursorPos(px + 3 + rw + 1, railY)
         mon.write(" ")
         mon.setBackgroundColour(colours.black)
     end
 
-    drawFrame()
+    local function drawBall(frac)
+        local rw = pw - 12
+        mon.setBackgroundColour(colours.grey)
+        mon.setCursorPos(px + 5, railY)
+        mon.write(string.rep(" ", rw - 2))
+        mon.setBackgroundColour(colours.red)
+        mon.setCursorPos(px + 5 + math.floor((rw - 2) * frac), railY)
+        mon.write(" ")
+        mon.setBackgroundColour(colours.black)
+    end
+
+    local footer = "<> delay 0.1s   [Enter] back"
+    mon.setBackgroundColour(colours.grey)
+    mon.setTextColour(colours.white)
+    mon.setCursorPos(px + math.floor((pw - #footer) / 2), py + ph - 2)
+    mon.write(footer)
+    mon.setBackgroundColour(colours.black)
+
+    drawValue()
+    drawRail()
+
     local t0 = os.clock()
-    local hitK = 1               -- next wall-hit number (hits at t0 + k*PERIOD)
+    local hitK = 1
     while true do
-        local elapsed = os.clock() - t0
-        drawBall((elapsed % PERIOD) / PERIOD)
-        -- blips are scheduled like movie audio: shifted by the delay setting,
-        -- so the calibration transfers 1:1 to playback
+        drawBall((os.clock() - t0) % PERIOD / PERIOD)
         while os.clock() >= t0 + hitK * PERIOD + DELAY_MS / 1000 do
             if sp then sp.playNote("pling", 20, 1) end
             hitK = hitK + 1
@@ -210,16 +264,13 @@ local function settingsScreen()
     end
 end
 
--- ---------- player ----------
 local function play(NAME)
-    -- fresh start: wipe ALL stale video parts (any movie) - the disk fills up otherwise
     for _, f in ipairs(fs.list("")) do
         if f:match("%.ccm%.%d+$") then fs.delete(f) end
     end
 
     local function pname(i) return NAME .. ".ccm." .. i end
 
-    -- meta: "W H FPS PARTS"
     print("Fetching " .. NAME .. "...")
     local res, err = http.get(BASE .. "/" .. urlencode(NAME) .. ".meta", nil, true)
     if not res then error("Meta download failed: " .. tostring(err), 0) end
@@ -244,7 +295,6 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    -- ---------- download manager ----------
     local dlCur = 0
     local dl = nil
 
@@ -256,58 +306,76 @@ local function play(NAME)
         return total
     end
 
-    -- ---------- on-monitor buffering UI (best effort) ----------
     local lastUiDraw = 0
     local uiEnabled = true
     local SPIN = { "|", "/", "-", "\\" }
+    local speedT0 = os.clock()
+    local speedB0 = 0
+
     local function uiStatus(sub)
         if not uiEnabled then return end
         local ok = pcall(function()
-            local mw, mh = mon.getSize()
-            if not mw or not mh or mw < 16 or mh < 7 then return end
             local b = bufferedAhead()
             local frac = math.min(1, b / PREFILL)
             local pct = math.floor(frac * 100 + 0.5)
 
             mon.setBackgroundColour(colours.black)
-            mon.setTextColour(colours.white)
             mon.clear()
-            local cy = math.floor(mh / 2)
-            local title = #NAME > mw - 2 and NAME:sub(1, mw - 2) or NAME
+            local pw = math.min(MW - 4, 56)
+            local ph = 13
+            local px = math.max(2, math.floor((MW - pw) / 2))
+            local py = math.max(2, math.floor((MH - ph) / 2))
+
+            box(px, py, pw, ph, colours.blue)
             mon.setTextColour(colours.yellow)
-            mon.setCursorPos(math.max(1, math.floor((mw - #title) / 2) + 1), cy - 2)
+            mon.setBackgroundColour(colours.black)
+            mon.setCursorPos(px + 2, py)
+            mon.write(" NOW LOADING ")
+
+            local title = #NAME > pw - 6 and NAME:sub(1, pw - 6) or NAME
+            mon.setTextColour(colours.white)
+            mon.setCursorPos(px + 3, py + 2)
             mon.write(title)
 
-            local bw = mw - 14
-            if bw % 2 == 1 then bw = bw + 1 end
-            local bx = math.max(2, math.floor((mw - bw) / 2) + 1)
+            local pctStr = pct .. "%"
+            mon.setTextColour(colours.lime)
+            mon.setCursorPos(px + 3, py + 4)
+            mon.write(pctStr)
+
+            local bx, bw = px + 3, pw - 6
+            local barY = py + 5
             mon.setTextColour(colours.lightGrey)
-            mon.setBackgroundColour(colours.black)
-            mon.setCursorPos(bx - 1, cy)
+            mon.setCursorPos(bx, barY)
             mon.write("[")
-            mon.setCursorPos(bx + bw, cy)
+            mon.setCursorPos(bx + bw - 1, barY)
             mon.write("]")
-            mon.setBackgroundColour(colours.gray)
-            mon.setCursorPos(bx, cy)
-            mon.write(string.rep(" ", bw))
-            local fill = math.min(bw, math.floor(bw * frac + 0.5))
+            mon.setBackgroundColour(colours.grey)
+            mon.setCursorPos(bx + 1, barY)
+            mon.write(string.rep(" ", bw - 2))
+            local fill = math.min(bw - 2, math.floor((bw - 2) * frac + 0.5))
             if fill > 0 then
                 mon.setBackgroundColour(colours.lime)
-                mon.setCursorPos(bx, cy)
+                mon.setCursorPos(bx + 1, barY)
                 mon.write(string.rep(" ", fill))
             end
             mon.setBackgroundColour(colours.black)
 
-            local stats = ("%d%%  %.1f/%.1fMB"):format(pct, b / 1000000, PREFILL / 1000000)
-            mon.setTextColour(colours.white)
-            mon.setCursorPos(math.max(1, math.floor((mw - #stats) / 2) + 1), cy + 1)
+            local el = os.clock() - speedT0
+            local rate = el > 0.5 and (b - speedB0) / el or 0
+            local stats
+            if rate > 0 then
+                stats = ("%.1f/%.1fMB  %.1fMB/s"):format(b / 1000000, PREFILL / 1000000, rate / 1000000)
+            else
+                stats = ("%.1f/%.1fMB"):format(b / 1000000, PREFILL / 1000000)
+            end
+            mon.setTextColour(colours.lightGrey)
+            mon.setCursorPos(bx + 1, py + 7)
             mon.write(stats)
 
             local line = (sub or "loading") .. " " .. SPIN[math.floor(os.clock() * 2) % 4 + 1]
             mon.setTextColour(colours.lightBlue)
-            mon.setCursorPos(math.max(1, math.floor((mw - #line) / 2) + 1), cy + 2)
+            mon.setCursorPos(bx + 1, py + 9)
             mon.write(line)
-            mon.setTextColour(colours.white)
         end)
         if not ok then uiEnabled = false end
     end
@@ -351,14 +419,12 @@ local function play(NAME)
         local b = bufferedAhead()
         if b ~= lastB then lastB, lastT = b, os.clock() end
         uiStatusThrottled("buffering")
-        -- disk full / tunnel stalled but enough buffered? just start playing
         if (os.clock() - lastT > 5 or fs.getFreeSpace("") < 1500000) and b >= PART_LOW then
             break
         end
         sleep(0.05)
     end
 
-    -- ---------- playback helpers ----------
     local function render(frame)
         local y = 1
         for r0 in string.gmatch(frame, "[^;]+") do
@@ -454,7 +520,7 @@ local function play(NAME)
                 end
                 hnd = fs.open(pname(curPart), "rb")
                 if curPart > 0 and fs.exists(pname(curPart - 1)) then
-                    fs.delete(pname(curPart - 1))   -- free watched parts
+                    fs.delete(pname(curPart - 1))
                 end
             end
             local t = hnd.read()
@@ -496,7 +562,6 @@ local function play(NAME)
                 cachedFrame = (t == 3) and decodeRLE(payload) or decodePacked(payload)
             end
             if not start then start = os.epoch("utc") + 150 end
-            -- hold the picture to the real-time schedule
             while os.epoch("utc") < start + fi * frameDur do
                 pump(PART_LOW)
                 sleep(0.01)
@@ -506,9 +571,6 @@ local function play(NAME)
             framesPlayed = framesPlayed + 1
         end
 
-        -- audio may only go out when BOTH hold (with +-120ms slop):
-        --   its real-time slot (+user delay) arrived
-        --   the picture has rendered up to that point
         while #pendingAudio > 0 and sp and start do
             local due = start + ai * 250 + DELAY_MS
             if os.epoch("utc") < due - 120 then break end
@@ -523,7 +585,6 @@ local function play(NAME)
         lastIter = nowC
     end
 
-    -- flush any audio left at the end so the finale isn't silent
     while #pendingAudio > 0 and sp do
         playAudioChunk(table.remove(pendingAudio, 1))
     end
@@ -534,7 +595,6 @@ local function play(NAME)
     mon.clear()
 end
 
--- ---------- boot ----------
 local argName = ...
 if argName and #argName > 0 then
     play(argName)
