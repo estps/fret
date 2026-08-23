@@ -324,9 +324,10 @@ local function play(NAME)
     end
 
     local function pname(i) return NAME .. ".ccm." .. i end
+    local enc = urlencode(NAME)
 
     print("Fetching " .. NAME .. "...")
-    local res, err = http.get(BASE .. "/" .. urlencode(NAME) .. ".meta", nil, true)
+    local res, err = http.get(BASE .. "/" .. enc .. "/" .. enc .. ".meta", nil, true)
     if not res then error("Meta download failed: " .. tostring(err), 0) end
     local body = res.readAll()
     res.close()
@@ -481,7 +482,7 @@ local function play(NAME)
             return
         end
         if dlCur <= lastPart and bufferedAhead() < target and fs.getFreeSpace("") > 1500000 then
-            local res, err = http.get(BASE .. "/" .. urlencode(pname(dlCur)), nil, true)
+            local res, err = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(dlCur)), nil, true)
             if not res then
                 print("part dl failed: " .. tostring(err) .. ", retrying")
                 sleep(2)
