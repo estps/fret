@@ -346,6 +346,10 @@ while true do
             cachedFrame = (t == 3) and decodeRLE(payload) or decodePacked(payload)
         end
         if not start then start = os.epoch("utc") + 150 end
+        while os.epoch("utc") < start + fi * frameDur do
+            pump(PART_LOW)
+            sleep(0.01)
+        end
         render(cachedFrame)
         fi = fi + 1
         framesPlayed = framesPlayed + 1
