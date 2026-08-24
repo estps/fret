@@ -1303,12 +1303,12 @@ local function play(NAME)
         end
     end
 
-    local function assemble(cells)
+    local function assemble(digits)
         local rowW = cw * (MODE >= 1 and 2 or 1)
         local rows = {}
         local pos = 1
         for _ = 1, chh do
-            rows[#rows + 1] = table.concat(cells, "", pos, pos + rowW - 1)
+            rows[#rows + 1] = digits:sub(pos, pos + rowW - 1)
             pos = pos + rowW
         end
         return table.concat(rows, ";")
@@ -1325,29 +1325,35 @@ local function play(NAME)
         return table.concat(rows, ";")
     end
 
-    local function decodePacked(p)
+    -- decode a payload into its flat digit string (colours OR glyphs)
+    local function unpackDigits(p, rle)
         local cells = {}
         local ci = 0
-        for i = 1, #p do
-            local b = string.byte(p, i)
-            ci = ci + 1; cells[ci] = toHex(math.floor(b / 16))
-            ci = ci + 1; cells[ci] = toHex(b % 16)
+        if rle then
+            for i = 1, #p, 2 do
+                local cnt = string.byte(p, i)
+                local v = toHex(string.byte(p, i + 1))
+                for _ = 1, cnt do
+                    ci = ci + 1
+                    cells[ci] = v
+                end
+            end
+        else
+            for i = 1, #p do
+                local b = string.byte(p, i)
+                ci = ci + 1; cells[ci] = toHex(math.floor(b / 16))
+                ci = ci + 1; cells[ci] = toHex(b % 16)
+            end
         end
-        return assemble(cells)
+        return table.concat(cells)
+    end
+
+    local function decodePacked(p)
+        return assemble(unpackDigits(p, false))
     end
 
     local function decodeRLE(p)
-        local cells = {}
-        local ci = 0
-        for i = 1, #p, 2 do
-            local cnt = string.byte(p, i)
-            local v = toHex(string.byte(p, i + 1))
-            for _ = 1, cnt do
-                ci = ci + 1
-                cells[ci] = v
-            end
-        end
-        return assemble(cells)
+        return assemble(unpackDigits(p, true))
     end
 
     local function playAudioChunk(p)
@@ -1587,7 +1593,7 @@ local function play(NAME)
                         local sub = g5payload:byte(1)
                         local body = g5payload:sub(2)
                         cachedGlyphs = assembleGlyphs(
-                            sub == 3 and decodeRLE(body) or decodePacked(body))
+                            unpackDigits(body, sub == 3))
                     end
                 end
             end
