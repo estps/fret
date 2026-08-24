@@ -3,17 +3,33 @@ local BASE = "https://simple-greene-freight-back.trycloudflare.com"
 
 local PART_LOW = 4000000
 local PREFILL = 7500000
+local IDLE_SAVER = 75
 
 local SETTINGS_FILE = ".cctv_settings"
 local DELAY_MS = 0
+local VOL = 1.0
+local SFX = true
 if fs.exists(SETTINGS_FILE) then
     local f = fs.open(SETTINGS_FILE, "r")
-    DELAY_MS = tonumber(f.readLine()) or 0
+    local first = f.readLine() or ""
+    if first:find("=") then
+        f.seek("set", 0)
+        while true do
+            local ln = f.readLine()
+            if not ln then break end
+            local k, v = ln:match("^(%w+)=(.+)$")
+            if k == "delay" then DELAY_MS = tonumber(v) or 0 end
+            if k == "vol" then VOL = math.min(3, math.max(0, tonumber(v) or 1)) end
+            if k == "sfx" then SFX = v == "1" end
+        end
+    else
+        DELAY_MS = tonumber(first) or 0
+    end
     f.close()
 end
-local function saveDelay()
+local function saveSettings()
     local f = fs.open(SETTINGS_FILE, "w")
-    f.write(tostring(DELAY_MS))
+    f.write(("delay=%d\nvol=%.2f\nsfx=%d\n"):format(DELAY_MS, VOL, SFX and 1 or 0))
     f.close()
 end
 
@@ -48,6 +64,12 @@ local THEME = {
     { colours.orange,    255, 138, 44 },
     { colours.purple,    128, 98, 232 },
     { colours.red,       236, 66, 56 },
+    { colours.green,     60, 160, 70 },
+    { colours.magenta,   214, 80, 200 },
+    { colours.pink,      235, 120, 170 },
+    { colours.brown,     130, 90, 55 },
+    { colours.white,     236, 238, 242 },
+    { colours.black,     5, 6, 9 },
 }
 local function applyTheme()
     for _, t in ipairs(THEME) do
@@ -66,22 +88,46 @@ local function clockStr()
 end
 
 local function fetchMovies()
-    local found = {}
+    local found, ok = {}, false
     local res = http.get(BASE .. "/movies.txt", nil, true)
     if res then
+        ok = true
         local body = res.readAll()
         res.close()
         for line in body:gmatch("[^\r\n]+") do
-            found[#found + 1] = line
+            local lab, dur = line:match("^(.-)%s+(%-?%d+%.?%d*)$")
+            if lab and #lab > 0 then
+                found[#found + 1] = { label = lab, dur = tonumber(dur) }
+            elseif #line > 0 then
+                found[#found + 1] = { label = line }
+            end
         end
     end
     if #found == 0 then
         for _, f in ipairs(fs.list("")) do
             local n = f:match("^(.+)%.meta$")
-            if n and #n > 0 then found[#found + 1] = n end
+            if n and #n > 0 then found[#found + 1] = { label = n } end
         end
     end
-    return found
+    return found, ok
+end
+
+local SEEN_FILE = ".cctv_seen"
+local seen = {}
+if fs.exists(SEEN_FILE) then
+    local f = fs.open(SEEN_FILE, "r")
+    while true do
+        local ln = f.readLine()
+        if not ln then break end
+        seen[ln] = true
+    end
+    f.close()
+end
+local function markSeen(name)
+    seen[name] = true
+    local f = fs.open(SEEN_FILE, "w")
+    for k in pairs(seen) do f.write(k .. "\n") end
+    f.close()
 end
 
 local function chip(x, y, s, bg, fg)
@@ -107,6 +153,7 @@ end
 
 local function centre(y, s, c)
     mon.setTextColour(c)
+    mon.setBackgroundColour(colours.black)
     mon.setCursorPos(math.max(1, math.floor((MW - #s) / 2) + 1), y)
     mon.write(s)
 end
@@ -128,10 +175,17 @@ local GLYPH = {
     C = { " ### ", "#   #", "#    ", "#   #", " ### " },
     T = { "#####", "  #  ", "  #  ", "  #  ", "  #  " },
     V = { "#   #", "#   #", "#   #", " # # ", "  #  " },
+    P = { "#### ", "#   #", "#### ", "#    ", "#    " },
+    A = { " ### ", "#   #", "#####", "#   #", "#   #" },
+    U = { "#   #", "#   #", "#   #", "#   #", " ### " },
+    S = { " ####", "#    ", " ### ", "    #", "#### " },
+    E = { "#####", "#    ", "###  ", "#    ", "#####" },
+    D = { "#### ", "#   #", "#   #", "#   #", "#### " },
 }
 
 local function drawGlyph(ch, x, y, c)
     local g = GLYPH[ch]
+    if not g then return end
     mon.setBackgroundColour(c)
     for r = 1, 5 do
         for i = 1, 5 do
@@ -144,69 +198,230 @@ local function drawGlyph(ch, x, y, c)
     mon.setBackgroundColour(colours.black)
 end
 
+local function wordWidth(w) return #w * 6 - 1 end
+
+local function drawWord(w, x, y, c)
+    for i = 1, #w do
+        local ch = w:sub(i, i)
+        if ch ~= " " then drawGlyph(ch, x + (i - 1) * 6, y, c) end
+    end
+    mon.setBackgroundColour(colours.black)
+end
+
 local function drawLogo(x, y)
     local cx = x
-    drawGlyph("C", cx, y, colours.lime);     cx = cx + 6
-    drawGlyph("C", cx, y, colours.lime);     cx = cx + 7
-    drawGlyph("T", cx, y, colours.cyan);     cx = cx + 6
+    drawGlyph("C", cx, y, colours.lime); cx = cx + 6
+    drawGlyph("C", cx, y, colours.lime); cx = cx + 7
+    drawGlyph("T", cx, y, colours.cyan); cx = cx + 6
     drawGlyph("V", cx, y, colours.cyan)
     mon.setBackgroundColour(colours.black)
 end
 
-local CARD_W, CARD_H, GAP = 17, 9, 2
-local HEADER_ROWS = 8
-local ACCENTS = { colours.lime, colours.cyan, colours.purple, colours.orange,
-                  colours.lightBlue, colours.pink }
-
-local function drawCard(it, idx, cx, cy, selected)
-    local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
-    mon.setBackgroundColour(colours.lightGrey)
-    mon.setCursorPos(cx, cy)
-    mon.write(string.rep(" ", CARD_W))
-    mon.setBackgroundColour(selected and colours.blue or colours.grey)
-    for r = 1, CARD_H - 2 do
-        mon.setCursorPos(cx, cy + r)
-        mon.write(string.rep(" ", CARD_W))
-    end
-    mon.setBackgroundColour(acc)
-    for r = 2, CARD_H - 2 do
-        mon.setCursorPos(cx, cy + r)
-        mon.write("  ")
-    end
-    mon.setTextColour(selected and colours.white or colours.lightBlue)
-    mon.setCursorPos(cx + 3, cy + 2)
-    mon.write(it.label:sub(1, CARD_W - 4))
-    local sub = #it.label > CARD_W - 4 and it.label:sub(CARD_W - 3, CARD_W * 2 - 6) or (it.sub or "")
-    if sub ~= "" then
-        mon.setTextColour(selected and colours.lightBlue or colours.lightGrey)
-        mon.setCursorPos(cx + 3, cy + 3)
-        mon.write(sub:sub(1, CARD_W - 4))
-    end
-    mon.setTextColour(colours.lightGrey)
-    mon.setCursorPos(cx + CARD_W - 7, cy + CARD_H - 3)
-    mon.write(it.kind == "settings" and "SYSTEM" or "MOVIE")
-    mon.setBackgroundColour(selected and colours.yellow or colours.lightGrey)
-    mon.setCursorPos(cx, cy + CARD_H - 1)
-    mon.write(string.rep(" ", CARD_W))
-    mon.setBackgroundColour(colours.black)
+local function fmtDur(sec)
+    if not sec or sec <= 0 then return nil end
+    sec = math.floor(sec + 0.5)
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    if h > 0 then return ("%dh%02dm"):format(h, m) end
+    if m > 0 then return ("%dm"):format(m) end
+    return ("%ds"):format(sec)
 end
 
-local function homeMenu(movies)
+local function blip(kind)
+    if not SFX or not sp then return end
+    pcall(function()
+        if kind == "move" then sp.playNote("bit", 0.25, 20)
+        elseif kind == "open" then sp.playNote("bit", 0.3, 16)
+        elseif kind == "back" then sp.playNote("bit", 0.22, 10)
+        else sp.playNote("bit", 0.25, 12) end
+    end)
+end
+
+local CARD_W, CARD_H = 17, 9
+local GAPX, GAPY = 2, 1
+local HEADER_ROWS = 8
+
+local function homeMenu(movies, online)
     local items = {}
-    for _, m in ipairs(movies) do items[#items + 1] = { label = m } end
+    for _, m in ipairs(movies) do
+        items[#items + 1] = {
+            label = m.label, dur = m.dur,
+            kind = "movie",
+            isNew = not seen[m.label],
+        }
+    end
     items[#items + 1] = { label = "Settings", kind = "settings", sub = "audio sync" }
-    local fit = math.max(1, math.floor((MW - 2) / (CARD_W + GAP)))
-    local sel, scroll = 1, 1
+    local n = #items
+
+    local cols = math.max(1, math.floor((MW - 2) / (CARD_W + GAPX)))
+    local rows = math.max(1, math.min(3, math.floor((MH - HEADER_ROWS - 3) / (CARD_H + GAPY))))
+    local totalCols = math.ceil(n / rows)
+    local pages = math.max(1, math.ceil(totalCols / cols))
     local cardsY = HEADER_ROWS + 1
+
+    local sel = 1
+    local c0 = 0
+    local anim = nil
+    local tick = 0
+    local savedMsg = 0
+
+    local function selCol() return math.floor((sel - 1) / rows) end
+    local function selRow() return (sel - 1) % rows end
+
+    local function ensureVisible()
+        local c = selCol()
+        if c < c0 or c >= c0 + cols then
+            anim = { from = c0, to = c - math.floor(cols / 2) + (c < c0 and cols or 0) }
+            anim.to = (c < c0) and c or (c - cols + 1)
+            anim.t = 0
+        end
+    end
+
+    local function viewX()
+        if anim then
+            local f = math.min(1, anim.t)
+            return math.floor(anim.from + (anim.to - anim.from) * f + 0.5)
+        end
+        return c0
+    end
+
+    local ACCENTS = { colours.lime, colours.cyan, colours.purple, colours.orange,
+                      colours.lightBlue, colours.pink, colours.magenta, colours.green }
+
+    local function drawCardReal(it, idx, x, y, selected)
+        local vw = math.min(CARD_W, MW - x + 1)
+        if vw < 6 then return end
+        local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
+        mon.setBackgroundColour(selected and colours.yellow or colours.lightGrey)
+        mon.setCursorPos(math.max(1, x + 1), y)
+        mon.write(string.rep(" ", math.min(CARD_W - 2, MW - x - 1)))
+        mon.setCursorPos(math.max(1, x + 1), y + CARD_H - 1)
+        mon.write(string.rep(" ", math.min(CARD_W - 2, MW - x - 1)))
+        local bwid = math.min(CARD_W - 2, MW - (x + 1) + 1)
+        mon.setBackgroundColour(selected and colours.blue or colours.grey)
+        for r = 1, CARD_H - 2 do
+            mon.setCursorPos(x + 1, y + r)
+            mon.write(string.rep(" ", bwid))
+        end
+        mon.setBackgroundColour(acc)
+        for r = 2, CARD_H - 3 do
+            mon.setCursorPos(x + 1, y + r)
+            mon.write("  ")
+        end
+        mon.setBackgroundColour(selected and colours.blue or colours.grey)
+        for r = 3, CARD_H - 3, 2 do
+            mon.setCursorPos(x + 1, y + r)
+            mon.write(" ")
+        end
+        if selected and x + CARD_W - 2 <= MW then
+            mon.setBackgroundColour(colours.yellow)
+            for r = 2, CARD_H - 2 do
+                mon.setCursorPos(x + CARD_W - 2, y + r)
+                mon.write(" ")
+            end
+        end
+        local maxT = math.min(CARD_W - 5, MW - (x + 4) + 1)
+        if maxT > 0 then
+            local title = it.label
+            if selected and #title > CARD_W - 5 then
+                local cyc = title .. "   "
+                local pos = (math.floor(tick / 4) % (#title + 3)) + 1
+                local ext = cyc .. cyc
+                title = ext:sub(pos, pos + maxT - 1)
+            else
+                title = title:sub(1, maxT)
+            end
+            mon.setTextColour(selected and colours.white or colours.lightBlue)
+            mon.setCursorPos(x + 4, y + 2)
+            mon.write(title)
+            local sub = it.sub or fmtDur(it.dur)
+            mon.setTextColour(selected and colours.lightBlue or colours.lightGrey)
+            mon.setCursorPos(x + 4, y + 3)
+            mon.write(sub and sub:sub(1, maxT) or "")
+        end
+        local tag = it.kind == "settings" and "SYSTEM"
+            or (it.isNew and "NEW!" or "MOVIE")
+        local tagX = x + CARD_W - 2 - #tag
+        if tagX + #tag <= MW + 1 then
+            mon.setTextColour(it.isNew and it.kind ~= "settings" and colours.yellow
+                or colours.lightGrey)
+            mon.setCursorPos(tagX, y + CARD_H - 3)
+            mon.write(tag)
+        end
+        mon.setBackgroundColour(colours.black)
+    end
+
+    local function drawGrid()
+        local vx = viewX()
+        local cA = math.max(0, vx)
+        local cB = vx + cols
+        mon.setBackgroundColour(colours.black)
+        local bandH = rows * (CARD_H + GAPY) - GAPY
+        for r = 0, bandH - 1 do
+            mon.setCursorPos(1, cardsY + r)
+            mon.write(string.rep(" ", MW))
+        end
+        for c = cA, cB do
+            for r = 0, rows - 1 do
+                local idx = c * rows + r + 1
+                local it = items[idx]
+                if it then
+                    local x = 2 + (c - vx) * (CARD_W + GAPX)
+                    local y = cardsY + r * (CARD_H + GAPY)
+                    drawCardReal(it, idx, x, y, idx == sel)
+                end
+            end
+        end
+        if n <= 1 then
+            mon.setTextColour(colours.lightGrey)
+            mon.setCursorPos(2, cardsY + bandH + 1)
+            mon.write("(no movies yet - transcode one with prepare.py)")
+        end
+        if pages > 1 then
+            local page = math.floor(c0 / cols) + 1
+            local dy = cardsY + rows * (CARD_H + GAPY) + (n <= 1 and 1 or 0)
+            local dx = math.max(1, math.floor((MW - pages * 2) / 2) + 1)
+            for p = 1, pages do
+                mon.setTextColour(colours.black)
+                mon.setBackgroundColour(p == page and colours.lime or colours.lightGrey)
+                mon.setCursorPos(dx + (p - 1) * 2, dy)
+                mon.write("\7")
+            end
+            mon.setBackgroundColour(colours.black)
+        end
+    end
+
+    local function drawInfoLine()
+        mon.setBackgroundColour(colours.black)
+        mon.setCursorPos(2, HEADER_ROWS)
+        mon.write(string.rep(" ", MW - 2))
+        local it = items[sel]
+        if it and it.kind == "movie" then
+            mon.setTextColour(colours.lightGrey)
+            mon.setCursorPos(2, HEADER_ROWS)
+            mon.write(("%d/%d"):format(sel, n))
+            if it.dur then
+                mon.write("  " .. fmtDur(it.dur))
+            end
+            if it.isNew then
+                chip(math.max(1, MW - 11), HEADER_ROWS, " UNWATCHED ", colours.yellow, colours.black)
+            end
+        end
+    end
 
     local function drawChrome()
         mon.setBackgroundColour(colours.black)
         mon.clear()
         drawLogo(2, 1)
-        if clockStr() ~= "" then
+        local cs = clockStr()
+        segments(5, MW - 17, {
+            { t = online and " ONLINE " or " OFFLINE", c = colours.black },
+        }, online and colours.green or colours.red)
+        if cs ~= "" then
             mon.setTextColour(colours.lightBlue)
-            mon.setCursorPos(math.max(1, MW - #clockStr() + 1), 5)
-            mon.write(clockStr())
+            mon.setBackgroundColour(colours.black)
+            mon.setCursorPos(math.max(1, MW - #cs + 1), 5)
+            mon.write(cs)
         end
         mon.setTextColour(colours.lightGrey)
         mon.setCursorPos(2, 6)
@@ -215,7 +430,7 @@ local function homeMenu(movies)
         mon.setCursorPos(2, 7)
         mon.write("YOUR MOVIES")
         mon.setTextColour(colours.lightGrey)
-        mon.write("  " .. tostring(#movies))
+        drawInfoLine()
         segments(MH, 1, {
             { t = " <>", c = colours.lime },
             { t = " browse", c = colours.lightBlue },
@@ -223,76 +438,149 @@ local function homeMenu(movies)
             { t = " open", c = colours.lightBlue },
             { t = "   tap", c = colours.cyan },
             { t = " card", c = colours.lightBlue },
+            { t = "   H", c = colours.lime },
+            { t = " help", c = colours.lightBlue },
         }, colours.grey)
         mon.setTextColour(colours.lightGrey)
         mon.setCursorPos(math.max(1, MW - 9), MH)
-        mon.write(tostring(#items) .. " items ")
+        mon.write(tostring(n) .. " items ")
     end
 
-    local function drawRow()
-        mon.setBackgroundColour(colours.black)
-        for r = 0, CARD_H - 1 do
-            mon.setCursorPos(1, cardsY + r)
-            mon.write(string.rep(" ", MW))
+    local function helpOverlay()
+        box(4, 4, math.min(MW - 8, 44), 13, colours.cyan)
+        chip(6, 4, " CONTROLS ", colours.cyan, colours.black)
+        local lines = {
+            { "<> / tap edges",   "browse pages" },
+            { "up/down",          "switch row" },
+            { "Enter / tap card", "play" },
+            { "R / tap status",   "refresh list" },
+            { "SPACE or tap",     "pause / resume" },
+            { "Q / BACKSPACE",    "back to menu" },
+            { "in player:",       "MENU chip exits" },
+        }
+        for i, l in ipairs(lines) do
+            mon.setTextColour(colours.white)
+            mon.setCursorPos(6, 4 + i)
+            mon.write(l[1])
+            mon.setTextColour(colours.lightBlue)
+            mon.setCursorPos(6 + 16, 4 + i)
+            mon.write(l[2])
         end
-        for k = 0, fit - 1 do
-            local idx = scroll + k
-            local it = items[idx]
-            if not it then break end
-            drawCard(it, idx, 2 + k * (CARD_W + GAP), cardsY, idx == sel)
-        end
-        if #movies == 0 then
-            mon.setTextColour(colours.lightGrey)
-            mon.setCursorPos(2, cardsY + CARD_H + 1)
-            mon.write("(no movies yet - transcode one with prepare.py)")
-        end
+        centre(4 + 9, "press any key or tap to close", colours.lightGrey)
+        os.pullEvent()
+        blip("back")
     end
 
-    drawChrome()
-    drawRow()
-    while true do
-        local ev, a, b, c = os.pullEvent()
-        local prev = sel
-        if ev == "key" then
-            local key = a
-            if key == keys.right then sel = sel < #items and sel + 1 or 1 end
-            if key == keys.left then sel = sel > 1 and sel - 1 or #items end
-            if (key == keys.enter or key == keys.space) and items[sel] then
-                return items[sel]
+    local function saverLoop()
+        local sx, sy = 3, 3
+        local dx, dy = 1, 1
+        while true do
+            mon.setBackgroundColour(colours.black)
+            mon.clear()
+            drawLogo(sx, sy)
+            centre(MH - 2, clockStr(), colours.lightBlue)
+            local step = 0.12
+            sx = sx + dx * 3
+            sy = sy + dy
+            if sx < 1 then sx = 1; dx = 1 end
+            if sy < 1 then sy = 1; dy = 1 end
+            if sx + 25 > MW then sx = MW - 25; dx = -1 end
+            if sy + 5 > MH then sy = MH - 5; dy = -1 end
+            local id = os.startTimer(step)
+            local ev = os.pullEvent()
+            if ev == "key" or ev == "monitor_touch" then
+                blip("back")
+                return
             end
-        elseif ev == "monitor_touch" then
-            local x, y = b, c
-            if y >= cardsY and y < cardsY + CARD_H then
-                local k = math.floor((x - 2) / (CARD_W + GAP))
-                local idx = scroll + k
-                local cx = 2 + k * (CARD_W + GAP)
-                if idx >= 1 and idx <= #items and x >= cx and x < cx + CARD_W then
-                    return items[idx]
+        end
+    end
+
+    local lastEvent = os.clock()
+    drawChrome()
+    drawGrid()
+    while true do
+        local id = os.startTimer(0.1)
+        local ev, a, b, cc = os.pullEvent()
+        local needsRedraw = false
+
+        if os.clock() - lastEvent > IDLE_SAVER then
+            saverLoop()
+            drawChrome()
+            drawGrid()
+            lastEvent = os.clock()
+        end
+
+        if ev == "timer" and a == id then
+            tick = tick + 1
+            if anim then
+                anim.t = anim.t + 0.34
+                if anim.t >= 1 then
+                    c0 = anim.to
+                    anim = nil
+                end
+                drawGrid()
+            else
+                local it = items[sel]
+                if tick % 4 == 0 and it and it.kind == "movie"
+                    and #it.label > CARD_W - 5 then
+                    drawGrid()
                 end
             end
-        end
-        if sel ~= prev then
-            local oldScroll = scroll
-            if sel < scroll then scroll = sel end
-            if sel > scroll + fit - 1 then scroll = sel - fit + 1 end
-            if scroll ~= oldScroll then
-                drawRow()
+        elseif ev == "key" then
+            lastEvent = os.clock()
+            local prev = sel
+            if a == keys.right then sel = sel >= n and 1 or sel + 1 end
+            if a == keys.left then sel = sel <= 1 and n or sel - 1 end
+            if a == keys.up and sel - rows >= 1 then sel = sel - rows end
+            if a == keys.down and sel + rows <= n then sel = sel + rows end
+            if sel ~= prev then
+                blip("move")
+                ensureVisible()
+                drawGrid()
+                drawInfoLine()
+            end
+            if a == keys.enter or a == keys.space then
+                if items[sel] then blip("open") return items[sel] end
+            end
+            if a == keys.h then helpOverlay(); drawChrome(); drawGrid() end
+            if a == keys.r then return { kind = "_refresh" } end
+        elseif ev == "monitor_touch" then
+            lastEvent = os.clock()
+            local x, y = b, cc
+            if y == 5 and x >= MW - 18 then
+                return { kind = "_refresh" }
+            end
+            if x <= 1 and pages > 1 then
+                c0 = math.max(0, c0 - cols); anim = nil; blip("page"); drawGrid()
+            elseif x >= MW and pages > 1 then
+                c0 = math.min(totalCols - cols, c0 + cols); anim = nil; blip("page"); drawGrid()
             else
-                for k = 0, fit - 1 do
-                    local idx = scroll + k
-                    if idx == sel or idx == prev then
-                        drawCard(items[idx], idx, 2 + k * (CARD_W + GAP), cardsY, idx == sel)
+                local rel = y - cardsY
+                if rel >= 0 then
+                    local r = math.floor(rel / (CARD_H + GAPY))
+                    local within = rel % (CARD_H + GAPY)
+                    if r < rows and within < CARD_H then
+                        local k = math.floor((x - 2) / (CARD_W + GAPX))
+                        local c = c0 + k
+                        local cx = 2 + k * (CARD_W + GAPX)
+                        local idx = c * rows + r + 1
+                        if idx >= 1 and idx <= n and x >= cx and x < cx + CARD_W and x < MW - 1 then
+                            sel = idx
+                            blip("open")
+                            return items[idx]
+                        end
                     end
                 end
             end
         end
+        if savedMsg > 0 and os.clock() > savedMsg then savedMsg = 0 end
     end
 end
 
 local function settingsScreen()
     local PERIOD = 1.0
     local pw = math.min(MW - 4, 60)
-    local ph = 13
+    local ph = 16
     local px = math.max(2, math.floor((MW - pw) / 2))
     local py = math.max(2, math.floor((MH - ph) / 2))
 
@@ -302,50 +590,116 @@ local function settingsScreen()
     chip(px + 2, py, " AUDIO SYNC ", colours.yellow, colours.black)
     mon.setBackgroundColour(colours.black)
 
-    local valueY, railY, noteY = py + 3, py + 6, py + 8
+    local valueY, railY, noteY, btnY, volY, sfxY, swY =
+        py + 2, py + 4, py + 6, py + 8, py + 10, py + 12, py + 13
+    local rw = pw - 12
+    local railX = px + 4
+    local pendingClick = nil
+    local savedAt = 0
 
     local function drawValue()
-        local dv = ("delay  %+.1f s"):format(DELAY_MS / 1000)
+        local dv = ("%+.1f s  (%+d ms)"):format(DELAY_MS / 1000, DELAY_MS)
         mon.setTextColour(colours.white)
-        mon.setCursorPos(px + math.floor((pw - #dv) / 2), valueY)
-        mon.write(dv .. string.rep(" ", 4))
-        centre(noteY, "align the click with each bounce", colours.lightBlue)
         mon.setBackgroundColour(colours.black)
+        mon.setCursorPos(px + math.floor((pw - #dv) / 2), valueY)
+        mon.write(dv .. string.rep(" ", 6))
+        if os.clock() - savedAt < 0.6 then
+            chip(px + pw - 10, valueY, " SAVED ", colours.lime, colours.black)
+        end
+        centre(noteY, "align the click with each bounce", colours.lightBlue)
     end
-
-    local rw = pw - 12
 
     local function drawRail(frac)
         mon.setBackgroundColour(colours.lightGrey)
-        mon.setCursorPos(px + 4, railY)
+        mon.setCursorPos(railX, railY)
         mon.write(string.rep(" ", rw))
-        chip(px + 4 + math.floor(rw / 2), railY, " ", colours.black, colours.white)
-        local bx2 = px + 4 + math.min(rw - 1, math.floor(rw * frac))
+        chip(railX + math.floor(rw / 2), railY, " ", colours.black, colours.white)
+        local bx2 = railX + math.min(rw - 1, math.floor(rw * frac))
         chip(bx2, railY, " ", colours.yellow, colours.black)
         mon.setBackgroundColour(colours.black)
     end
 
-    local btnY = py + ph - 3
-    local btnW = 7
-    local totalW = btnW * 2 + 6 + 4
-    local bx0 = px + math.floor((pw - totalW) / 2)
-    local minusRect = { x = bx0, y = btnY, w = btnW }
-    local backRect = { x = bx0 + btnW + 2, y = btnY, w = 6 }
-    local plusRect = { x = bx0 + btnW + 10, y = btnY, w = btnW }
+    local btnW, gapB = 7, 1
+    local defs = {
+        { id = "minus", t = " -0.1s ", bg = colours.lightGrey, fg = colours.white },
+        { id = "plus",  t = " +0.1s ", bg = colours.lightGrey, fg = colours.white },
+        { id = "test",  t = " TEST  ", bg = colours.lime,      fg = colours.black },
+        { id = "reset", t = " RESET ", bg = colours.yellow,    fg = colours.black },
+        { id = "back",  t = " BACK  ", bg = colours.orange,    fg = colours.black },
+    }
+    local rowW = #defs * btnW + (#defs - 1) * gapB
+    local bx0 = px + math.floor((pw - rowW) / 2)
+    for i, d in ipairs(defs) do
+        d.x, d.y, d.w = bx0 + (i - 1) * (btnW + gapB), btnY, btnW
+    end
 
     local function drawButtons()
-        chip(minusRect.x, btnY, " -0.1s ", colours.lightGrey, colours.white)
-        chip(backRect.x, btnY, " BACK ", colours.grey, colours.lightBlue)
-        chip(plusRect.x, btnY, " +0.1s ", colours.lightGrey, colours.white)
+        for _, d in ipairs(defs) do chip(d.x, d.y, d.t, d.bg, d.fg) end
         mon.setBackgroundColour(colours.black)
+    end
+
+    local vmX = px + 4
+    local barW = 10
+    local volMinus = { x = vmX, y = volY, w = 3 }
+    local volBarX = vmX + 4
+    local volPlus = { x = volBarX + barW + 1, y = volY, w = 3 }
+
+    local function drawVolume()
+        chip(volMinus.x, volY, " - ", colours.lightGrey, colours.white)
+        mon.setTextColour(colours.lightBlue)
+        mon.setCursorPos(volBarX, volY)
+        local filled = math.floor(VOL / 3 * barW + 0.5)
+        for i = 0, barW - 1 do
+            mon.setBackgroundColour(i < filled and colours.cyan or colours.lightGrey)
+            mon.setCursorPos(volBarX + i, volY)
+            mon.write(" ")
+        end
+        chip(volPlus.x, volY, " + ", colours.lightGrey, colours.white)
+        mon.setBackgroundColour(colours.black)
+        mon.setTextColour(colours.lightGrey)
+        mon.setCursorPos(volPlus.x + 4, volY)
+        mon.write(("%3d%%"):format(math.floor(VOL / 3 * 100 + 0.5)))
+        mon.setBackgroundColour(colours.black)
+    end
+
+    local sfxBtn = { x = px + 4, y = sfxY, w = 10 }
+
+    local function drawSfx()
+        chip(sfxBtn.x, sfxY, SFX and " SFX ON  " or " SFX OFF ", 
+             SFX and colours.green or colours.lightGrey, colours.black)
+        mon.setBackgroundColour(colours.black)
+    end
+
+    local function drawSwatches()
+        for i = 1, 16 do
+            mon.setBackgroundColour(THEME[i][1])
+            mon.setCursorPos(px + 4 + (i - 1), swY)
+            mon.write(" ")
+        end
+        mon.setBackgroundColour(colours.black)
+    end
+
+    local function changed()
+        saveSettings()
+        savedAt = os.clock()
+        drawValue()
     end
 
     drawValue()
     drawRail(0)
     drawButtons()
+    drawVolume()
+    drawSfx()
+    drawSwatches()
 
     local function hit(r, x, y)
         return x >= r.x and x < r.x + r.w and y == r.y
+    end
+
+    local function adjust(d)
+        DELAY_MS = math.max(-5000, math.min(5000, DELAY_MS + d))
+        changed()
+        blip("move")
     end
 
     local t0 = os.clock()
@@ -353,34 +707,46 @@ local function settingsScreen()
     while true do
         drawRail((os.clock() - t0) % PERIOD / PERIOD)
         while os.clock() >= t0 + hitK * PERIOD + DELAY_MS / 1000 do
-            if sp then sp.playNote("pling", 20, 1) end
+            if sp then pcall(sp.playNote, "pling", 1.0, 20) end
             hitK = hitK + 1
         end
+        if pendingClick and os.clock() >= pendingClick then
+            if sp then pcall(sp.playNote, "bit", VOL, 16) end
+            pendingClick = nil
+        end
+        drawValue()
+
         local id = os.startTimer(0.04)
         local ev, p, tx, ty = os.pullEvent()
         if ev == "key" then
-            if p == keys.right then
-                DELAY_MS = math.min(5000, DELAY_MS + 100)
-                saveDelay()
-                drawValue()
-            elseif p == keys.left then
-                DELAY_MS = math.max(-5000, DELAY_MS - 100)
-                saveDelay()
-                drawValue()
+            if p == keys.right then adjust(100)
+            elseif p == keys.left then adjust(-100)
+            elseif p == keys.up then VOL = math.min(3, VOL + 0.1); changed(); drawVolume()
+            elseif p == keys.down then VOL = math.max(0, VOL - 0.1); changed(); drawVolume()
+            elseif p == keys.t then pendingClick = os.clock() + DELAY_MS / 1000
+            elseif p == keys.r then DELAY_MS = 0; changed()
+            elseif p == keys.s then SFX = not SFX; changed(); drawSfx()
             elseif p == keys.enter or p == keys.q or p == keys.backspace then
-                return
+                blip("back") return
             end
         elseif ev == "monitor_touch" then
-            if hit(minusRect, tx, ty) then
-                DELAY_MS = math.max(-5000, DELAY_MS - 100)
-                saveDelay()
-                drawValue()
-            elseif hit(plusRect, tx, ty) then
-                DELAY_MS = math.min(5000, DELAY_MS + 100)
-                saveDelay()
-                drawValue()
-            elseif hit(backRect, tx, ty) then
-                return
+            local hitBtn = nil
+            for _, d in ipairs(defs) do
+                if hit(d, tx, ty) then hitBtn = d.id break end
+            end
+            if hitBtn == "minus" then adjust(-100)
+            elseif hitBtn == "plus" then adjust(100)
+            elseif hitBtn == "test" then pendingClick = os.clock() + DELAY_MS / 1000
+            elseif hitBtn == "reset" then DELAY_MS = 0; changed()
+            elseif hitBtn == "back" then blip("back") return
+            elseif hit(volMinus, tx, ty) then VOL = math.max(0, VOL - 0.1); changed(); drawVolume()
+            elseif hit(volPlus, tx, ty) then VOL = math.min(3, VOL + 0.1); changed(); drawVolume()
+            elseif hit(sfxBtn, tx, ty) then SFX = not SFX; changed(); drawSfx(); blip("move")
+            elseif ty == railY and tx >= railX and tx < railX + rw then
+                local frac = (tx - railX) / (rw - 1)
+                DELAY_MS = math.floor((frac * 2 - 1) * 5000 / 100 + 0.5) * 100
+                DELAY_MS = math.max(-5000, math.min(5000, DELAY_MS))
+                changed()
             end
         end
     end
@@ -409,11 +775,11 @@ local function play(NAME)
     local w, h, fps, partCount, blk = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*)")
     w, h, fps, partCount = tonumber(w), tonumber(h), tonumber(fps), tonumber(partCount)
     if not w then error("Corrupt meta file", 0) end
-    local n = tonumber(blk) or 1
-    local cw, ch = w * n, h * n
+    local nb = tonumber(blk) or 1
+    local cw, chh = w * nb, h * nb
     local lastPart = partCount - 1
 
-    local win = window.create(mon, 1, 1, cw, ch, false)
+    local win = window.create(mon, 1, 1, cw, chh, false)
 
     local function toHex(v)
         if v < 10 then return string.char(48 + v) end
@@ -465,16 +831,18 @@ local function play(NAME)
     local speedT0 = os.clock()
     local speedB0 = 0
     local LW = math.min(MW - 4, 56)
-    local LH = 13
+    local LH = 15
     local LX = math.max(2, math.floor((MW - LW) / 2))
     local LY = math.max(2, math.floor((MH - LH) / 2))
     local LBX, LBW = LX + 3, LW - 6
+    local cancelRect = { x = LX + LW - 9, y = LY, w = 8 }
 
     local function buildLoading()
         mon.setBackgroundColour(colours.black)
         mon.clear()
         box(LX, LY, LW, LH, colours.lightGrey)
         chip(LX + 2, LY, " NOW LOADING ", colours.lime, colours.black)
+        chip(cancelRect.x, LY, " CANCEL ", colours.red, colours.white)
         mon.setBackgroundColour(colours.black)
         local title = #NAME > LBW and NAME:sub(1, LBW) or NAME
         mon.setTextColour(colours.white)
@@ -489,10 +857,6 @@ local function play(NAME)
         mon.write("[")
         mon.setCursorPos(LBX + LBW - 2, LY + 5)
         mon.write("]")
-        segments(LY + LH - 2, LBX + 1, {
-            { t = " Q", c = colours.yellow },
-            { t = " cancel", c = colours.lightBlue },
-        }, colours.grey)
         uiBuilt = true
     end
 
@@ -531,10 +895,17 @@ local function play(NAME)
             mon.setTextColour(colours.lightBlue)
             mon.setCursorPos(LBX + 1, LY + 7)
             mon.write(stats .. string.rep(" ", LBW - 1 - #stats))
+            local meta = ("part %d/%d   disk %dMB free")
+                :format(math.min(nextPart, lastPart + 1), lastPart + 1,
+                        math.floor(fs.getFreeSpace("") / 1000000))
+            if #meta > LBW - 2 then meta = meta:sub(1, LBW - 2) end
+            mon.setTextColour(colours.lightGrey)
+            mon.setCursorPos(LBX + 1, LY + 9)
+            mon.write(meta .. string.rep(" ", LBW - 1 - #meta))
             local line = ((sub or "loading") .. " " .. SPIN[math.floor(os.clock() * 2) % 4 + 1])
             if #line > LBW - 2 then line = line:sub(1, LBW - 2) end
             mon.setTextColour(colours.cyan)
-            mon.setCursorPos(LBX + 1, LY + 9)
+            mon.setCursorPos(LBX + 1, LY + 11)
             mon.write(line .. string.rep(" ", LBW - 1 - #line))
         end)
         if not ok then uiEnabled = false end
@@ -567,15 +938,15 @@ local function play(NAME)
         end
         while #dls < MAXDL and nextPart <= lastPart
              and bufferedAhead() < target and fs.getFreeSpace("") > 1500000 do
-            local res, err = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
-            if not res then
-                print("part dl failed: " .. tostring(err) .. ", retrying")
+            local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
+            if not res2 then
+                print("part dl failed: " .. tostring(err2) .. ", retrying")
                 sleep(2)
                 break
             end
             local tmp = pname(nextPart) .. ".part"
             local fh = fs.open(tmp, "wb")
-            dls[#dls + 1] = { idx = nextPart, res = res, fh = fh, tmp = tmp }
+            dls[#dls + 1] = { idx = nextPart, res = res2, fh = fh, tmp = tmp }
             nextPart = nextPart + 1
         end
     end
@@ -583,7 +954,7 @@ local function play(NAME)
     local function render(frame)
         local y = 1
         for r0 in string.gmatch(frame, "[^;]+") do
-            if y > ch then break end
+            if y > chh then break end
             win.setCursorPos(1, y)
             local r = r0
             local n2 = #r
@@ -614,7 +985,7 @@ local function play(NAME)
     local function assemble(cells)
         local rows = {}
         local pos = 1
-        for _ = 1, ch do
+        for _ = 1, chh do
             rows[#rows + 1] = table.concat(cells, "", pos, pos + cw - 1)
             pos = pos + cw
         end
@@ -657,7 +1028,7 @@ local function play(NAME)
                 tt[idx] = (b % (2 ^ (j + 1)) >= 2 ^ j) and 127 or -128
             end
         end
-        while not sp.playAudio(tt) do
+        while not sp.playAudio(tt, VOL) do
             os.pullEvent("speaker_audio_empty")
         end
     end
@@ -692,9 +1063,37 @@ local function play(NAME)
                 resumeRect, menuRect = nil, nil
             end
             mon.setBackgroundColour(colours.black)
+            local ww = wordWidth("PAUSED")
+            local bw = ww + 8
+            if MW > bw + 2 then
+                local bx = math.floor((MW - bw) / 2) + 1
+                local by = math.floor(MH / 2) - 3
+                mon.setBackgroundColour(colours.black)
+                for r = 0, 6 do
+                    mon.setCursorPos(bx, by + r)
+                    mon.write(string.rep(" ", bw))
+                end
+                drawWord("PAUSED", bx + 4, by + 1, colours.yellow)
+                centre(by + 6, "tap anywhere to resume", colours.lightBlue)
+            end
+            local frac = curPart / (lastPart + 1)
+            mon.setBackgroundColour(colours.lightGrey)
+            mon.setCursorPos(1, MH - 1)
+            mon.write(string.rep(" ", MW))
+            local pf = math.floor(MW * frac + 0.5)
+            if pf > 0 then
+                mon.setBackgroundColour(colours.lime)
+                mon.setCursorPos(1, MH - 1)
+                mon.write(string.rep(" ", pf))
+            end
+            mon.setBackgroundColour(colours.black)
+            local secs = math.floor(bufferedAhead() / 36000)
+            centre(MH - 3, ("buffered ~%ds ahead"):format(secs), colours.lightBlue)
         else
             resumeRect, menuRect = nil, nil
             mon.setBackgroundColour(colours.black)
+            mon.setCursorPos(1, MH - 1)
+            mon.write(string.rep(" ", MW))
             mon.setCursorPos(1, MH)
             mon.write(string.rep(" ", MW))
         end
@@ -722,7 +1121,10 @@ local function play(NAME)
     end
 
     local function handleTouch(x, y)
-        if not start then return end
+        if not start then
+            if inRect(cancelRect, x, y) then abortPlay = true end
+            return
+        end
         if paused then
             if inRect(menuRect, x, y) then
                 abortPlay = true
@@ -864,15 +1266,30 @@ if argName and #argName > 0 then
     return
 end
 
-local movies = fetchMovies()
+if MW >= 32 then
+    mon.setBackgroundColour(colours.black)
+    mon.clear()
+    for _, x in ipairs({ 26, 18, 11, 6, 2 }) do
+        mon.setBackgroundColour(colours.black)
+        mon.clear()
+        drawLogo(math.max(2, math.floor(x)), math.floor(MH / 2) - 2)
+        sleep(0.06)
+    end
+    sleep(0.15)
+end
+
+local movies, online = fetchMovies()
 while true do
-    local it = homeMenu(movies)
-    if it.kind == "settings" then
+    local it = homeMenu(movies, online)
+    if it.kind == "_refresh" then
+        movies, online = fetchMovies()
+    elseif it.kind == "settings" then
         settingsScreen()
     else
+        markSeen(it.label)
         play(it.label)
         resetPalette()
         applyTheme()
-        movies = fetchMovies()
+        movies, online = fetchMovies()
     end
 end
