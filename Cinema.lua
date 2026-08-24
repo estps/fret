@@ -1026,16 +1026,17 @@ local function play(NAME)
     mf = fs.open(NAME .. ".meta", "r")
     local hdr = mf.readLine()
     mf.close()
-    -- header: pixelW pixelH fps parts [block] [scaleTenths]
-    local w, h, fps, partCount, blk, scl = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*) (%d*)")
+    -- header: pixelW pixelH fps parts [block] [mode]
+    local w, h, fps, partCount, blk, md = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*) (%d*)")
     w, h, fps, partCount = tonumber(w), tonumber(h), tonumber(fps), tonumber(partCount)
     if not w then error("Corrupt meta file", 0) end
     local nb = tonumber(blk) or 1
-    local scale = (tonumber(scl) or 5) / 10
+    local MODE = tonumber(md) or 0    -- 0 classic, 1 half-blocks, 2 shade-blend
+    local HALF = MODE == 1
     local cw, chh = w * nb, h * nb     -- character grid actually rendered
     local lastPart = partCount - 1
 
-    pcall(function() mon.setTextScale(scale) end)
+    mon.setTextScale(0.5)
     MW, MH = mon.getSize()
     if math.floor(MW + 0.5) < cw or math.floor(MH + 0.5) < chh then
         print(("monitor %dx%d too small for %dx%d grid"):format(MW, MH, cw, chh))
@@ -1074,6 +1075,7 @@ local function play(NAME)
     local frameDur = 1000 / fps
     local pendingAudio = {}
     local cachedFrame
+    local cachedGlyphs
     local curPart = 0
     local hnd = nil
     local paused = false
@@ -1229,19 +1231,60 @@ local function play(NAME)
     end
 
     -- ---------- playback helpers ----------
-    local function render(frame)
+    local HALF_GLYPH = string.char(143)   -- font top-block: fg=upper, bg=lower
+    local halfRowText = nil
+    local SHADE_CHARS = {}
+    do
+        local set = " /(\219\177\127@"
+        for i = 1, #set do SHADE_CHARS[tostring(i - 1)] = set:sub(i, i) end
+    end
+
+    local function render(frame, glyphs)
         local y = 1
         for r0 in string.gmatch(frame, "[^;]+") do
             if y > chh then break end
             win.setCursorPos(1, y)
             local r = r0
-            local n2 = #r
-            if n2 >= cw then
-                r = r:sub(1, cw)
-                win.blit(string.rep(" ", cw), r, r)
-            elseif n2 > 0 then
-                local pad = r:sub(-1):rep(cw - n2)
-                win.blit(string.rep(" ", cw), r .. pad, r .. pad)
+            if MODE == 2 then
+                local n3 = #r
+                if n3 >= cw * 3 then
+                    r = r:sub(1, cw * 3)
+                elseif n3 > 0 then
+                    r = r .. r:sub(-1):rep(cw * 3 - n3)
+                else
+                    r = string.rep("ff0", cw)
+                end
+                local colours = r:sub(1, cw * 2)
+                local gdig = glyphs and glyphs:sub((y - 1) * cw + 1, y * cw)
+                if not gdig or #gdig < cw then
+                    gdig = string.rep("0", cw)
+                end
+                local fg = (colours:gsub("(.)(.)", "%1"))
+                local bg = (colours:gsub("(.)(.)", "%2"))
+                local txt = (gdig:gsub("%x", SHADE_CHARS))
+                win.blit(txt, fg, bg)
+            elseif HALF then
+                local n2 = #r
+                if n2 >= cw * 2 then
+                    r = r:sub(1, cw * 2)
+                elseif n2 > 0 then
+                    r = r .. r:sub(-1):rep(cw * 2 - n2)
+                else
+                    r = string.rep("f", cw * 2)
+                end
+                local top = r:sub(1, cw)
+                local bot = r:sub(cw + 1, cw * 2)
+                if not halfRowText then halfRowText = HALF_GLYPH:rep(cw) end
+                win.blit(halfRowText, top, bot)
+            else
+                local n2 = #r
+                if n2 >= cw then
+                    r = r:sub(1, cw)
+                    win.blit(string.rep(" ", cw), r, r)
+                elseif n2 > 0 then
+                    local pad = r:sub(-1):rep(cw - n2)
+                    win.blit(string.rep(" ", cw), r .. pad, r .. pad)
+                end
             end
             y = y + 1
         end
@@ -1261,10 +1304,22 @@ local function play(NAME)
     end
 
     local function assemble(cells)
+        local rowW = cw * (MODE >= 1 and 2 or 1)
         local rows = {}
         local pos = 1
         for _ = 1, chh do
-            rows[#rows + 1] = table.concat(cells, "", pos, pos + cw - 1)
+            rows[#rows + 1] = table.concat(cells, "", pos, pos + rowW - 1)
+            pos = pos + rowW
+        end
+        return table.concat(rows, ";")
+    end
+
+    local function assembleGlyphs(digits)
+        if not digits then return nil end
+        local rows = {}
+        local pos = 1
+        for _ = 1, chh do
+            rows[#rows + 1] = digits:sub(pos, pos + cw - 1)
             pos = pos + cw
         end
         return table.concat(rows, ";")
@@ -1411,7 +1466,7 @@ local function play(NAME)
         else
             start = start + (os.epoch("utc") - pausedAt)   -- slide schedule
             drawPauseBar(false)
-            if cachedFrame then render(cachedFrame) end
+            if cachedFrame then render(cachedFrame, cachedGlyphs) end
         end
     end
 
@@ -1524,6 +1579,17 @@ local function play(NAME)
         elseif t == 0 or t == 2 or t == 3 then
             if t ~= 0 then
                 cachedFrame = (t == 3) and decodeRLE(payload) or decodePacked(payload)
+                if MODE == 2 then
+                    -- shade frames carry their glyph stream as a type-5
+                    -- record immediately after the colour record
+                    local g5, g5payload = nextRecord()
+                    if g5 == 5 and not abortPlay then
+                        local sub = g5payload:byte(1)
+                        local body = g5payload:sub(2)
+                        cachedGlyphs = assembleGlyphs(
+                            sub == 3 and decodeRLE(body) or decodePacked(body))
+                    end
+                end
             end
             if not start then start = os.epoch("utc") + 150 end
             -- hold the picture to the real-time schedule
@@ -1538,7 +1604,7 @@ local function play(NAME)
             end
             if abortPlay then break end
             if not paused then
-                render(cachedFrame)
+                render(cachedFrame, cachedGlyphs)
                 fi = fi + 1
             end
         end
