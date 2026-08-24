@@ -378,12 +378,14 @@ local function play(NAME)
     mf = fs.open(NAME .. ".meta", "r")
     local hdr = mf.readLine()
     mf.close()
-    local w, h, fps, partCount = hdr:match("(%d+) (%d+) (%d+) (%d+)")
+    local w, h, fps, partCount, blk = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*)")
     w, h, fps, partCount = tonumber(w), tonumber(h), tonumber(fps), tonumber(partCount)
     if not w then error("Corrupt meta file", 0) end
+    local n = tonumber(blk) or 1
+    local cw, ch = w * n, h * n
     local lastPart = partCount - 1
 
-    local win = window.create(mon, 1, 1, w, h, false)
+    local win = window.create(mon, 1, 1, cw, ch, false)
 
     local function toHex(v)
         if v < 10 then return string.char(48 + v) end
@@ -537,16 +539,16 @@ local function play(NAME)
     local function render(frame)
         local y = 1
         for r0 in string.gmatch(frame, "[^;]+") do
-            if y > h then break end
+            if y > ch then break end
             win.setCursorPos(1, y)
             local r = r0
-            local n = #r
-            if n >= w then
-                r = r:sub(1, w)
-                win.blit(string.rep(" ", w), r, r)
-            elseif n > 0 then
-                local pad = r:sub(-1):rep(w - n)
-                win.blit(string.rep(" ", w), r .. pad, r .. pad)
+            local n2 = #r
+            if n2 >= cw then
+                r = r:sub(1, cw)
+                win.blit(string.rep(" ", cw), r, r)
+            elseif n2 > 0 then
+                local pad = r:sub(-1):rep(cw - n2)
+                win.blit(string.rep(" ", cw), r .. pad, r .. pad)
             end
             y = y + 1
         end
@@ -568,9 +570,9 @@ local function play(NAME)
     local function assemble(cells)
         local rows = {}
         local pos = 1
-        for _ = 1, h do
-            rows[#rows + 1] = table.concat(cells, "", pos, pos + w - 1)
-            pos = pos + w
+        for _ = 1, ch do
+            rows[#rows + 1] = table.concat(cells, "", pos, pos + cw - 1)
+            pos = pos + cw
         end
         return table.concat(rows, ";")
     end
