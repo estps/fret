@@ -6,7 +6,7 @@
 -- Player: SPACE/P or TAP pause-resume  Q/BACKSPACE or MENU chip exit
 
 -- Paste your current pinggy https URL here (no trailing slash):
-local BASE = "https://dypln-46-132-80-222.free.pinggy.net"
+local BASE = "https://simple-greene-freight-back.trycloudflare.com"
 
 local PART_LOW = 4000000      -- refill below this much buffered-ahead
 local PREFILL = 7500000       -- buffer this much before pressing play
@@ -98,6 +98,19 @@ local function clockStr()
     return ""
 end
 
+local function parseMovieLines(body)
+    local found = {}
+    for line in body:gmatch("[^\r\n]+") do
+        local lab, dur = line:match("^(.-)%s+(%-?%d+%.?%d*)$")
+        if lab and #lab > 0 then
+            found[#found + 1] = { label = lab, dur = tonumber(dur) }
+        elseif #line > 0 then
+            found[#found + 1] = { label = line }
+        end
+    end
+    return found
+end
+
 local function fetchMovies()
     local found, ok = {}, false
     local res = http.get(BASE .. "/movies.txt", nil, true)
@@ -105,15 +118,7 @@ local function fetchMovies()
         ok = true
         local body = res.readAll()
         res.close()
-        -- lines are "Name" or "Name <seconds>" (duration written by prepare.py)
-        for line in body:gmatch("[^\r\n]+") do
-            local lab, dur = line:match("^(.-)%s+(%-?%d+%.?%d*)$")
-            if lab and #lab > 0 then
-                found[#found + 1] = { label = lab, dur = tonumber(dur) }
-            elseif #line > 0 then
-                found[#found + 1] = { label = line }
-            end
-        end
+        found = parseMovieLines(body)
     end
     if #found == 0 then   -- offline fallback: previously cached metas
         for _, f in ipairs(fs.list("")) do
@@ -324,6 +329,42 @@ local function homeMenu(movies, online)
     local anim = nil           -- {from,to,t} horizontal slide
     local tick = 0             -- drives marquee + blink
     local comet = nil          -- {fx,tx,y,t} selection underline glide
+    local onlineNow = online
+    local lastFetch = os.clock()
+    local refreshInflight = false
+
+    local function recalc()
+        n = #items
+        totalCols = math.ceil(n / rows)
+        pages = math.max(1, math.ceil(totalCols / cols))
+        if sel > n then sel = n end
+    end
+
+    local function applyMovieList(list)
+        movies = list
+        local keep = items[sel]
+        for i = #items, 1, -1 do items[i] = nil end
+        for _, m in ipairs(list) do
+            items[#items + 1] = {
+                label = m.label, dur = m.dur,
+                kind = "movie",
+                isNew = not seen[m.label],
+            }
+        end
+        items[#items + 1] = { label = "Settings", kind = "settings", sub = "audio sync" }
+        recalc()
+        if keep then
+            for i = 1, n do
+                if items[i].label == keep.label then sel = i break end
+            end
+        end
+    end
+
+    local function drawStatusChip()
+        segments(5, MW - 17, {
+            { t = onlineNow and " ONLINE " or " OFFLINE", c = colours.black },
+        }, onlineNow and colours.green or colours.red)
+    end
 
     local function selCol() return math.floor((sel - 1) / rows) end
     local function selColOf(i) return math.floor((i - 1) / rows) end
@@ -594,6 +635,12 @@ local function homeMenu(movies, online)
 
         if ev == "timer" and a == id then
             tick = tick + 1
+            -- background library refresh every 5s (non-blocking)
+            if not refreshInflight and os.clock() - lastFetch >= 5 then
+                lastFetch = os.clock()
+                refreshInflight = true
+                http.request(BASE .. "/movies.txt")
+            end
             -- blinking clock colon
             if tick % 5 == 0 then
                 local cs = clockStr()
@@ -739,6 +786,29 @@ local function homeMenu(movies, online)
                             return items[idx]
                         end
                     end
+                end
+            end
+        elseif ev == "http_success" or ev == "http_failure" then
+            if refreshInflight and tostring(a):find("movies%.txt") then
+                refreshInflight = false
+                local wasOnline = onlineNow
+                if ev == "http_success" then
+                    local body = b.readAll()
+                    b.close()
+                    local list = parseMovieLines(body)
+                    if #list > 0 then
+                        applyMovieList(list)
+                        onlineNow = true
+                        drawStatusChip()
+                        drawGrid()
+                        drawInfoLine()
+                    else
+                        onlineNow = false
+                        drawStatusChip()
+                    end
+                else
+                    onlineNow = false
+                    drawStatusChip()
                 end
             end
         end
@@ -956,13 +1026,20 @@ local function play(NAME)
     mf = fs.open(NAME .. ".meta", "r")
     local hdr = mf.readLine()
     mf.close()
-    -- header: pixelW pixelH fps parts [block]  (block = chars per pixel side)
-    local w, h, fps, partCount, blk = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*)")
+    -- header: pixelW pixelH fps parts [block] [scaleTenths]
+    local w, h, fps, partCount, blk, scl = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*) (%d*)")
     w, h, fps, partCount = tonumber(w), tonumber(h), tonumber(fps), tonumber(partCount)
     if not w then error("Corrupt meta file", 0) end
     local nb = tonumber(blk) or 1
+    local scale = (tonumber(scl) or 5) / 10
     local cw, chh = w * nb, h * nb     -- character grid actually rendered
     local lastPart = partCount - 1
+
+    pcall(function() mon.setTextScale(scale) end)
+    MW, MH = mon.getSize()
+    if math.floor(MW + 0.5) < cw or math.floor(MH + 0.5) < chh then
+        print(("monitor %dx%d too small for %dx%d grid"):format(MW, MH, cw, chh))
+    end
 
     local win = window.create(mon, 1, 1, cw, chh, false)
 
@@ -1528,6 +1605,8 @@ if MW >= 32 then
     sleep(0.25)
 end
 
+local bootScale = 0.5
+pcall(function() bootScale = mon.getTextScale() end)
 local movies, online = fetchMovies()
 while true do
     local it = homeMenu(movies, online)
@@ -1547,6 +1626,8 @@ while true do
         play(it.label)
         resetPalette()
         applyTheme()
+        pcall(function() mon.setTextScale(bootScale) end)
+        MW, MH = mon.getSize()
         movies, online = fetchMovies()
     end
 end
