@@ -174,7 +174,7 @@ local function homeMenu(movies)
         mon.setTextColour(colours.white)
         mon.write(" CC TV")
         mon.setTextColour(colours.lightGrey)
-        mon.write("  v2")
+        mon.write("  v3")
         local c = clockStr()
         if c ~= "" then
             mon.setTextColour(colours.lightBlue)
@@ -194,6 +194,8 @@ local function homeMenu(movies)
             { t = " browse", c = colours.lightBlue },
             { t = "   Enter", c = colours.lime },
             { t = " open", c = colours.lightBlue },
+            { t = "   tap", c = colours.cyan },
+            { t = " card", c = colours.lightBlue },
         }, colours.grey)
         mon.setTextColour(colours.lightGrey)
         mon.setCursorPos(math.max(1, MW - 9), MH)
@@ -222,10 +224,26 @@ local function homeMenu(movies)
     drawChrome()
     drawRow()
     while true do
-        local _, key = os.pullEvent("key")
+        local ev, a, b, c = os.pullEvent()
         local prev = sel
-        if key == keys.right then sel = sel < #items and sel + 1 or 1 end
-        if key == keys.left then sel = sel > 1 and sel - 1 or #items end
+        if ev == "key" then
+            local key = a
+            if key == keys.right then sel = sel < #items and sel + 1 or 1 end
+            if key == keys.left then sel = sel > 1 and sel - 1 or #items end
+            if (key == keys.enter or key == keys.space) and items[sel] then
+                return items[sel]
+            end
+        elseif ev == "monitor_touch" then
+            local x, y = b, c
+            if y >= cardsY and y < cardsY + CARD_H then
+                local k = math.floor((x - 2) / (CARD_W + GAP))
+                local idx = scroll + k
+                local cx = 2 + k * (CARD_W + GAP)
+                if idx >= 1 and idx <= #items and x >= cx and x < cx + CARD_W then
+                    return items[idx]
+                end
+            end
+        end
         if sel ~= prev then
             local oldScroll = scroll
             if sel < scroll then scroll = sel end
@@ -240,9 +258,6 @@ local function homeMenu(movies)
                     end
                 end
             end
-        end
-        if (key == keys.enter or key == keys.space) and items[sel] then
-            return items[sel]
         end
     end
 end
@@ -282,15 +297,28 @@ local function settingsScreen()
         mon.setBackgroundColour(colours.black)
     end
 
-    segments(py + ph - 2, px + math.floor((pw - 30) / 2), {
-        { t = " <>", c = colours.yellow },
-        { t = " delay 0.1s", c = colours.lightBlue },
-        { t = "   Enter", c = colours.white },
-        { t = " back", c = colours.lightBlue },
-    }, colours.grey)
+    local btnY = py + ph - 3
+    local btnW = 7
+    local totalW = btnW * 2 + 6 + 4
+    local bx0 = px + math.floor((pw - totalW) / 2)
+    local minusRect = { x = bx0, y = btnY, w = btnW }
+    local backRect = { x = bx0 + btnW + 2, y = btnY, w = 6 }
+    local plusRect = { x = bx0 + btnW + 10, y = btnY, w = btnW }
+
+    local function drawButtons()
+        chip(minusRect.x, btnY, " -0.1s ", colours.lightGrey, colours.white)
+        chip(backRect.x, btnY, " BACK ", colours.grey, colours.lightBlue)
+        chip(plusRect.x, btnY, " +0.1s ", colours.lightGrey, colours.white)
+        mon.setBackgroundColour(colours.black)
+    end
 
     drawValue()
     drawRail(0)
+    drawButtons()
+
+    local function hit(r, x, y)
+        return x >= r.x and x < r.x + r.w and y == r.y
+    end
 
     local t0 = os.clock()
     local hitK = 1
@@ -301,7 +329,7 @@ local function settingsScreen()
             hitK = hitK + 1
         end
         local id = os.startTimer(0.04)
-        local ev, p = os.pullEvent()
+        local ev, p, tx, ty = os.pullEvent()
         if ev == "key" then
             if p == keys.right then
                 DELAY_MS = math.min(5000, DELAY_MS + 100)
@@ -312,6 +340,18 @@ local function settingsScreen()
                 saveDelay()
                 drawValue()
             elseif p == keys.enter or p == keys.q or p == keys.backspace then
+                return
+            end
+        elseif ev == "monitor_touch" then
+            if hit(minusRect, tx, ty) then
+                DELAY_MS = math.max(-5000, DELAY_MS - 100)
+                saveDelay()
+                drawValue()
+            elseif hit(plusRect, tx, ty) then
+                DELAY_MS = math.min(5000, DELAY_MS + 100)
+                saveDelay()
+                drawValue()
+            elseif hit(backRect, tx, ty) then
                 return
             end
         end
@@ -576,6 +616,12 @@ local function play(NAME)
         end
     end
 
+    local resumeRect, menuRect
+
+    local function inRect(r, x, y)
+        return r ~= nil and y == r.y and x >= r.x and x < r.x + r.w
+    end
+
     local function drawPauseBar(on)
         if on then
             mon.setBackgroundColour(colours.grey)
@@ -586,9 +632,22 @@ local function play(NAME)
             mon.setBackgroundColour(colours.grey)
             mon.setTextColour(colours.lightBlue)
             mon.setCursorPos(13, MH)
-            mon.write("SPACE resume   Q menu")
+            if MW >= 44 then
+                local menuW, resumeW = 8, 10
+                local menuX = MW - menuW + 1
+                local resumeX = menuX - resumeW - 1
+                mon.write("SPACE / tap")
+                chip(resumeX, MH, "  RESUME  ", colours.lime, colours.black)
+                chip(menuX, MH, "  MENU  ", colours.orange, colours.black)
+                resumeRect = { x = resumeX, y = MH, w = resumeW }
+                menuRect = { x = menuX, y = MH, w = menuW }
+            else
+                mon.write("SPACE resume   Q menu")
+                resumeRect, menuRect = nil, nil
+            end
             mon.setBackgroundColour(colours.black)
         else
+            resumeRect, menuRect = nil, nil
             mon.setBackgroundColour(colours.black)
             mon.setCursorPos(1, MH)
             mon.write(string.rep(" ", MW))
@@ -616,10 +675,27 @@ local function play(NAME)
         end
     end
 
+    local function handleTouch(x, y)
+        if not start then return end
+        if paused then
+            if inRect(menuRect, x, y) then
+                abortPlay = true
+            else
+                setPaused(false)
+            end
+        else
+            setPaused(true)
+        end
+    end
+
     local function waitEvents(t)
         local id = os.startTimer(t)
-        local ev, p1 = os.pullEvent()
-        if ev == "key" then handlePlayKey(p1) end
+        local ev, a, b, c = os.pullEvent()
+        if ev == "key" then
+            handlePlayKey(a)
+        elseif ev == "monitor_touch" then
+            handleTouch(b, c)
+        end
     end
 
     local function cleanup()
