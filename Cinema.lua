@@ -1,22 +1,15 @@
--- CC TV v5 - feature-loaded touchscreen launcher + buffered streaming cinema
--- PC: python prepare.py videofile.mp4   &&   python3 -m http.server 8080
--- Tunnel: ssh -p 443 -o StrictHostKeyChecking=no free.pinggy.io -R0:localhost:8080
---
--- Keys: <>/up/down browse  Enter open  H help  R refresh
--- Player: SPACE/P or TAP pause-resume  Q/BACKSPACE or MENU chip exit
 
--- Paste your current pinggy https URL here (no trailing slash):
+
 local BASE = "https://simple-greene-freight-back.trycloudflare.com"
 
-local PART_LOW = 4000000      -- refill below this much buffered-ahead
-local PREFILL = 7500000       -- buffer this much before pressing play
-local IDLE_SAVER = 75         -- seconds of silence before screensaver
+local PART_LOW = 4000000
+local PREFILL = 7500000
+local IDLE_SAVER = 75
 
--- ---------- persisted settings (v2 key=value, reads old single-number files) ----------
 local SETTINGS_FILE = ".cctv_settings"
-local DELAY_MS = 0            -- +audio later / -audio earlier
-local VOL = 1.0               -- speaker volume 0..3
-local SFX = true              -- ui sounds
+local DELAY_MS = 0
+local VOL = 1.0
+local SFX = true
 if fs.exists(SETTINGS_FILE) then
     local f = fs.open(SETTINGS_FILE, "r")
     local first = f.readLine() or ""
@@ -41,20 +34,18 @@ local function saveSettings()
     f.close()
 end
 
-local function urlencode(s)   -- names may contain spaces / brackets etc.
+local function urlencode(s)
     return s:gsub("[^%w%-_%.~]", function(c)
         return ("%%%02X"):format(string.byte(c))
     end)
 end
 
--- ---------- monitor ----------
 local mon = peripheral.find("monitor")
 if not mon then error("No monitor attached", 0) end
 mon.setTextScale(0.5)
 
 local sp = peripheral.find("speaker")
 
--- remember stock palette so movies can be restored cleanly
 local savedPal = {}
 for i = 0, 15 do savedPal[i + 1] = { mon.getPaletteColour(2 ^ i) } end
 local function resetPalette()
@@ -63,18 +54,17 @@ local function resetPalette()
     end
 end
 
--- dark theme: retint spare slots, movies override everything anyway
 local THEME = {
-    { colours.grey,      22, 24, 29 },   -- panel / card fill (near-black)
-    { colours.lightGrey, 54, 58, 68 },   -- hairlines, tracks
-    { colours.blue,      30, 42, 78 },   -- selection fill
-    { colours.lightBlue, 146, 158, 176 },-- secondary text
-    { colours.lime,      96, 218, 108 }, -- brand green
-    { colours.cyan,      62, 198, 216 }, -- accent
-    { colours.yellow,    255, 194, 64 }, -- highlight
-    { colours.orange,    255, 138, 44 }, -- settings accent
-    { colours.purple,    128, 98, 232 }, -- alt accent
-    { colours.red,       236, 66, 56 },  -- alerts
+    { colours.grey,      22, 24, 29 },
+    { colours.lightGrey, 54, 58, 68 },
+    { colours.blue,      30, 42, 78 },
+    { colours.lightBlue, 146, 158, 176 },
+    { colours.lime,      96, 218, 108 },
+    { colours.cyan,      62, 198, 216 },
+    { colours.yellow,    255, 194, 64 },
+    { colours.orange,    255, 138, 44 },
+    { colours.purple,    128, 98, 232 },
+    { colours.red,       236, 66, 56 },
     { colours.green,     60, 160, 70 },
     { colours.magenta,   214, 80, 200 },
     { colours.pink,      235, 120, 170 },
@@ -120,7 +110,7 @@ local function fetchMovies()
         res.close()
         found = parseMovieLines(body)
     end
-    if #found == 0 then   -- offline fallback: previously cached metas
+    if #found == 0 then
         for _, f in ipairs(fs.list("")) do
             local n = f:match("^(.+)%.meta$")
             if n and #n > 0 then found[#found + 1] = { label = n } end
@@ -129,7 +119,6 @@ local function fetchMovies()
     return found, ok
 end
 
--- watched-state tracking (drives the NEW badge)
 local SEEN_FILE = ".cctv_seen"
 local seen = {}
 if fs.exists(SEEN_FILE) then
@@ -148,7 +137,6 @@ local function markSeen(name)
     f.close()
 end
 
--- ---------- shared draw helpers ----------
 local function chip(x, y, s, bg, fg)
     mon.setBackgroundColour(bg)
     mon.setTextColour(fg)
@@ -156,7 +144,6 @@ local function chip(x, y, s, bg, fg)
     mon.write(s)
 end
 
--- parts: { {t=text, c=colour}, ... }; clipped to monitor width
 local function segments(y, x0, parts, bg)
     mon.setBackgroundColour(bg or colours.black)
     local x = x0
@@ -191,7 +178,6 @@ local function box(x0, y0, w, h, borderColour)
     mon.write("+" .. string.rep("-", w - 2) .. "+")
 end
 
--- ---------- pixel font ----------
 local GLYPH = {
     C = { " ### ", "#   #", "#    ", "#   #", " ### " },
     T = { "#####", "  #  ", "  #  ", "  #  ", "  #  " },
@@ -249,7 +235,6 @@ local function fmtDur(sec)
 end
 
 local function blip(kind)
-    -- tiny synth pack; pitch is semitones-ish, volume rides the user setting
     if not SFX or not sp then return end
     local v = math.min(1.5, 0.35 * VOL)
     pcall(function()
@@ -271,7 +256,6 @@ local function blip(kind)
     end)
 end
 
--- horizontal blinds wipe: cover the current screen before a new one draws
 local function blinds()
     local sw = 8
     local colsN = math.ceil(MW / sw)
@@ -293,14 +277,10 @@ local function blinds()
     mon.setBackgroundColour(colours.black)
 end
 
--- ============================================================
--- HOME SCREEN
--- ============================================================
 local CARD_W, CARD_H = 17, 9
 local GAPX, GAPY = 2, 1
-local HEADER_ROWS = 8         -- logo(5) + hairline + shelf label + info line
+local HEADER_ROWS = 8
 
--- toast state lives here so any screen (or the boot loop) can raise one
 local TOAST_MSG, TOAST_UNTIL = nil, 0
 local function showToast(m)
     TOAST_MSG, TOAST_UNTIL = m, os.clock() + 1.8
@@ -324,11 +304,11 @@ local function homeMenu(movies, online)
     local pages = math.max(1, math.ceil(totalCols / cols))
     local cardsY = HEADER_ROWS + 1
 
-    local sel = 1              -- 1..n
-    local c0 = 0               -- first visible column
-    local anim = nil           -- {from,to,t} horizontal slide
-    local tick = 0             -- drives marquee + blink
-    local comet = nil          -- {fx,tx,y,t} selection underline glide
+    local sel = 1
+    local c0 = 0
+    local anim = nil
+    local tick = 0
+    local comet = nil
     local onlineNow = online
     local lastFetch = os.clock()
     local refreshInflight = false
@@ -374,7 +354,6 @@ local function homeMenu(movies, online)
         local c = selCol()
         if c < c0 or c >= c0 + cols then
             anim = { from = c0, to = c - math.floor(cols / 2) + (c < c0 and cols or 0) }
-            -- snap fully into view instead of centering (simpler, predictable)
             anim.to = (c < c0) and c or (c - cols + 1)
             anim.t = 0
         end
@@ -388,29 +367,25 @@ local function homeMenu(movies, online)
         return c0
     end
 
-    -- real card renderer (accent colour derived from stable per-item hue)
     local ACCENTS = { colours.lime, colours.cyan, colours.purple, colours.orange,
                       colours.lightBlue, colours.pink, colours.magenta, colours.green }
 
     local function drawCardReal(it, idx, x, y, selected, pressed)
         local vw = math.min(CARD_W, MW - x + 1)
-        if vw < 6 then return end              -- fully/partially offscreen
+        if vw < 6 then return end
         local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
         local body = pressed and colours.lightGrey or (selected and colours.blue or colours.grey)
-        -- rounded corners: inset top/bottom hairlines
         mon.setBackgroundColour(selected and colours.yellow or colours.lightGrey)
         mon.setCursorPos(math.max(1, x + 1), y)
         mon.write(string.rep(" ", math.min(CARD_W - 2, MW - x - 1)))
         mon.setCursorPos(math.max(1, x + 1), y + CARD_H - 1)
         mon.write(string.rep(" ", math.min(CARD_W - 2, MW - x - 1)))
-        -- body
         local bwid = math.min(CARD_W - 2, MW - (x + 1) + 1)
         mon.setBackgroundColour(body)
         for r = 1, CARD_H - 2 do
             mon.setCursorPos(x + 1, y + r)
             mon.write(string.rep(" ", bwid))
         end
-        -- accent bar with film-strip perforations
         mon.setBackgroundColour(acc)
         for r = 2, CARD_H - 3 do
             mon.setCursorPos(x + 1, y + r)
@@ -421,7 +396,6 @@ local function homeMenu(movies, online)
             mon.setCursorPos(x + 1, y + r)
             mon.write(" ")
         end
-        -- selection side glow
         if selected and x + CARD_W - 2 <= MW then
             mon.setBackgroundColour(colours.yellow)
             for r = 2, CARD_H - 2 do
@@ -429,7 +403,6 @@ local function homeMenu(movies, online)
                 mon.write(" ")
             end
         end
-        -- title (+marquee when focused & long)
         local maxT = math.min(CARD_W - 5, MW - (x + 4) + 1)
         local tCol = pressed and colours.black
             or (selected and colours.white or colours.lightBlue)
@@ -448,13 +421,11 @@ local function homeMenu(movies, online)
             mon.setTextColour(tCol)
             mon.setCursorPos(x + 4, y + 2)
             mon.write(title)
-            -- subtitle line: duration / kind descriptor
             local sub = it.sub or fmtDur(it.dur)
             mon.setTextColour(sCol)
             mon.setCursorPos(x + 4, y + 3)
             mon.write(sub and sub:sub(1, maxT) or "")
         end
-        -- tag: NEW beats MOVIE
         local tag = it.kind == "settings" and "SYSTEM"
             or (it.isNew and "NEW!" or "MOVIE")
         local tagX = x + CARD_W - 2 - #tag
@@ -470,7 +441,7 @@ local function homeMenu(movies, online)
     local function drawGrid(stagger)
         local vx = viewX()
         local cA = math.max(0, vx)
-        local cB = vx + cols          -- one extra column either side while sliding
+        local cB = vx + cols
         mon.setBackgroundColour(colours.black)
         local bandH = rows * (CARD_H + GAPY) - GAPY
         for r = 0, bandH - 1 do
@@ -498,7 +469,6 @@ local function homeMenu(movies, online)
             mon.setCursorPos(2, cardsY + bandH + 1)
             mon.write("(no movies yet - transcode one with prepare.py)")
         end
-        -- page dots
         if pages > 1 then
             local page = math.floor(c0 / cols) + 1
             local dy = cardsY + rows * (CARD_H + GAPY) + (n <= 1 and 1 or 0)
@@ -535,7 +505,6 @@ local function homeMenu(movies, online)
         mon.setBackgroundColour(colours.black)
         mon.clear()
         drawLogo(2, 1)
-        -- status chip + clock, right aligned
         local cs = clockStr()
         segments(5, MW - 17, {
             { t = online and " ONLINE " or " OFFLINE", c = colours.black },
@@ -595,7 +564,6 @@ local function homeMenu(movies, online)
     end
 
     local function saverLoop()
-        -- DVD-style bouncing logo until any input
         local sx, sy = 3, 3
         local dx, dy = 1, 1
         while true do
@@ -621,7 +589,7 @@ local function homeMenu(movies, online)
 
     local lastEvent = os.clock()
     drawChrome()
-    drawGrid(true)             -- staggered card cascade on entry
+    drawGrid(true)
     while true do
         local id = os.startTimer(0.1)
         local ev, a, b, cc = os.pullEvent()
@@ -635,13 +603,11 @@ local function homeMenu(movies, online)
 
         if ev == "timer" and a == id then
             tick = tick + 1
-            -- background library refresh every 5s (non-blocking)
             if not refreshInflight and os.clock() - lastFetch >= 5 then
                 lastFetch = os.clock()
                 refreshInflight = true
                 http.request(BASE .. "/movies.txt")
             end
-            -- blinking clock colon
             if tick % 5 == 0 then
                 local cs = clockStr()
                 local cpos = cs:find(":", 1, true)
@@ -652,7 +618,6 @@ local function homeMenu(movies, online)
                     mon.write(tick % 10 < 5 and ":" or " ")
                 end
             end
-            -- hairline shimmer sweep under the logo
             if tick % 3 == 0 then
                 local sx2 = ((math.floor(tick / 3) * 7) % (MW - 8)) + 2
                 mon.setTextColour(colours.lightGrey)
@@ -664,7 +629,6 @@ local function homeMenu(movies, online)
                 mon.write("    ")
                 mon.setBackgroundColour(colours.black)
             end
-            -- toast expiry / paint
             if TOAST_MSG then
                 if os.clock() > TOAST_UNTIL then
                     mon.setBackgroundColour(colours.black)
@@ -677,7 +641,6 @@ local function homeMenu(movies, online)
                     mon.setBackgroundColour(colours.black)
                 end
             end
-            -- comet glide between cards
             if comet then
                 comet.t = comet.t + 0.4
                 local gx = math.floor(comet.fx + (comet.tx - comet.fx) * math.min(1, comet.t))
@@ -697,7 +660,6 @@ local function homeMenu(movies, online)
                 end
                 drawGrid()
             else
-                -- focus pulse on selected edge + marquee steps
                 local it = items[sel]
                 if it and tick % 6 == 0 and it.kind ~= nil then
                     local c = selCol()
@@ -728,7 +690,6 @@ local function homeMenu(movies, online)
             if a == keys.down and sel + rows <= n then sel = sel + rows end
             if sel ~= prev then
                 blip("move")
-                -- same-row single-step glide: animate the underline
                 local prow, nrow = (prev - 1) % rows, (sel - 1) % rows
                 local pcol, ncol = selColOf(prev), selCol()
                 if not anim and prow == nrow and math.abs(ncol - pcol) == 1
@@ -757,11 +718,9 @@ local function homeMenu(movies, online)
         elseif ev == "monitor_touch" then
             lastEvent = os.clock()
             local x, y = b, cc
-            -- status chip refresh
             if y == 5 and x >= MW - 18 then
                 return { kind = "_refresh" }
             end
-            -- edge paging zones
             if x <= 1 and pages > 1 then
                 c0 = math.max(0, c0 - cols); anim = nil; blip("page"); drawGrid()
             elseif x >= MW and pages > 1 then
@@ -779,7 +738,6 @@ local function homeMenu(movies, online)
                         if idx >= 1 and idx <= n and x >= cx and x < cx + CARD_W and x < MW - 1 then
                             sel = idx
                             blip("open")
-                            -- press-in feedback: invert the card for a beat
                             drawCardReal(items[idx], idx, cx,
                                          cardsY + r * (CARD_H + GAPY), true, true)
                             sleep(0.09)
@@ -815,11 +773,8 @@ local function homeMenu(movies, online)
     end
 end
 
--- ============================================================
--- SETTINGS - audio delay calibrator + volume + sfx
--- ============================================================
 local function settingsScreen()
-    local PERIOD = 1.0           -- seconds per crossing
+    local PERIOD = 1.0
     local pw = math.min(MW - 4, 60)
     local ph = 16
     local px = math.max(2, math.floor((MW - pw) / 2))
@@ -835,7 +790,7 @@ local function settingsScreen()
         py + 2, py + 4, py + 6, py + 8, py + 10, py + 12, py + 13
     local rw = pw - 12
     local railX = px + 4
-    local pendingClick = nil     -- scheduled second test-click (the delay gap)
+    local pendingClick = nil
     local savedAt = 0
 
     local function drawValue()
@@ -856,7 +811,6 @@ local function settingsScreen()
         mon.write(string.rep(" ", rw))
         chip(railX + math.floor(rw / 2), railY, " ", colours.black, colours.white)
         local bx2 = railX + math.min(rw - 1, math.floor(rw * frac))
-        -- motion-blur ghost trail behind the ball
         if bx2 - 2 >= railX then
             chip(bx2 - 2, railY, " ", colours.lightGrey, colours.black)
         end
@@ -951,10 +905,9 @@ local function settingsScreen()
     end
 
     local t0 = os.clock()
-    local hitK = 1               -- wall hits at t0 + k*PERIOD
+    local hitK = 1
     while true do
         drawRail((os.clock() - t0) % PERIOD / PERIOD)
-        -- calibration clicks ride the SAME delayed schedule as movie audio
         while os.clock() >= t0 + hitK * PERIOD + DELAY_MS / 1000 do
             if sp then pcall(sp.playNote, "pling", 1.0, 20) end
             hitK = hitK + 1
@@ -992,7 +945,6 @@ local function settingsScreen()
             elseif hit(volPlus, tx, ty) then VOL = math.min(3, VOL + 0.1); changed(); drawVolume()
             elseif hit(sfxBtn, tx, ty) then SFX = not SFX; changed(); drawSfx(); blip("move")
             elseif ty == railY and tx >= railX and tx < railX + rw then
-                -- drag anywhere on the rail to jump straight to that delay
                 local frac = (tx - railX) / (rw - 1)
                 DELAY_MS = math.floor((frac * 2 - 1) * 5000 / 100 + 0.5) * 100
                 DELAY_MS = math.max(-5000, math.min(5000, DELAY_MS))
@@ -1002,11 +954,7 @@ local function settingsScreen()
     end
 end
 
--- ============================================================
--- PLAYER
--- ============================================================
 local function play(NAME)
-    -- fresh start: wipe ALL stale video parts (any movie) - disk fills otherwise
     for _, f in ipairs(fs.list("")) do
         if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then fs.delete(f) end
     end
@@ -1026,14 +974,13 @@ local function play(NAME)
     mf = fs.open(NAME .. ".meta", "r")
     local hdr = mf.readLine()
     mf.close()
-    -- header: pixelW pixelH fps parts [block] [mode]
     local w, h, fps, partCount, blk, md = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*) (%d*)")
     w, h, fps, partCount = tonumber(w), tonumber(h), tonumber(fps), tonumber(partCount)
     if not w then error("Corrupt meta file", 0) end
     local nb = tonumber(blk) or 1
-    local MODE = tonumber(md) or 0    -- 0 classic, 1 half-blocks, 2 shade-blend
+    local MODE = tonumber(md) or 0
     local HALF = MODE == 1
-    local cw, chh = w * nb, h * nb     -- character grid actually rendered
+    local cw, chh = w * nb, h * nb
     local lastPart = partCount - 1
 
     mon.setTextScale(0.5)
@@ -1049,13 +996,11 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    -- ---------- download manager ----------
-    local MAXDL = 2               -- concurrent part downloads
-    local nextPart = 0            -- next part index to start fetching
-    local dls = {}                -- in-flight downloads
+    local MAXDL = 2
+    local nextPart = 0
+    local dls = {}
 
     local function bufferedAhead()
-        -- finalised parts count fully; in-flight .part temps count as-is
         local total = 0
         for i = 0, nextPart - 1 do
             local f = pname(i)
@@ -1069,7 +1014,6 @@ local function play(NAME)
         return total
     end
 
-    -- ---------- playback state ----------
     local start = nil
     local fi, ai = 0, 0
     local frameDur = 1000 / fps
@@ -1091,7 +1035,6 @@ local function play(NAME)
         dls = {}
     end
 
-    -- ---------- loading UI (static frame + dynamic updates) ----------
     local lastUiDraw = 0
     local uiEnabled = true
     local uiBuilt = false
@@ -1148,7 +1091,6 @@ local function play(NAME)
                 mon.setBackgroundColour(colours.lime)
                 mon.setCursorPos(LBX + 2, LY + 5)
                 mon.write(string.rep(" ", fill))
-                -- shine sweeping across the filled bar
                 local shineX = LBX + 2 + (math.floor(os.clock() * 8) % math.max(1, fill))
                 if shineX + 1 <= LBX + LBW - 3 then
                     mon.setBackgroundColour(colours.green)
@@ -1171,7 +1113,6 @@ local function play(NAME)
             mon.setTextColour(colours.lightBlue)
             mon.setCursorPos(LBX + 1, LY + 7)
             mon.write(stats .. string.rep(" ", LBW - 1 - #stats))
-            -- parts + disk meter
             local meta = ("part %d/%d   disk %dMB free")
                 :format(math.min(nextPart, lastPart + 1), lastPart + 1,
                         math.floor(fs.getFreeSpace("") / 1000000))
@@ -1197,7 +1138,6 @@ local function play(NAME)
     end
 
     local function pump(target)
-        -- service every in-flight download one chunk each
         local k = 1
         while k <= #dls do
             local d = dls[k]
@@ -1209,12 +1149,11 @@ local function play(NAME)
                 d.fh.close()
                 d.res.close()
                 if fs.exists(d.tmp) then
-                    pcall(fs.move, d.tmp, pname(d.idx))   -- publish complete part
+                    pcall(fs.move, d.tmp, pname(d.idx))
                 end
                 table.remove(dls, k)
             end
         end
-        -- top up the pipeline while under target
         while #dls < MAXDL and nextPart <= lastPart
              and bufferedAhead() < target and fs.getFreeSpace("") > 1500000 do
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
@@ -1230,8 +1169,7 @@ local function play(NAME)
         end
     end
 
-    -- ---------- playback helpers ----------
-    local HALF_GLYPH = string.char(143)   -- font top-block: fg=upper, bg=lower
+    local HALF_GLYPH = string.char(143)
     local halfRowText = nil
     local SHADE_CHARS = {}
     do
@@ -1325,7 +1263,6 @@ local function play(NAME)
         return table.concat(rows, ";")
     end
 
-    -- decode a payload into its flat digit string (colours OR glyphs)
     local function unpackDigits(p, rle)
         local cells = {}
         local ci = 0
@@ -1372,9 +1309,8 @@ local function play(NAME)
         end
     end
 
-    -- ---------- pause / abort ----------
-    local resumeRect, menuRect      -- set while the pause bar is visible
-    local eqRect = nil              -- EQ bars inside the pause stamp
+    local resumeRect, menuRect
+    local eqRect = nil
     local eqTick = 0
 
     local function drawEQ(k)
@@ -1419,7 +1355,6 @@ local function play(NAME)
                 resumeRect, menuRect = nil, nil
             end
             mon.setBackgroundColour(colours.black)
-            -- big centred PAUSED stamp
             local ww = wordWidth("PAUSED")
             local bw = ww + 8
             if MW > bw + 2 then
@@ -1439,7 +1374,6 @@ local function play(NAME)
                     eqRect = nil
                 end
             end
-            -- playback progress line (part-resolution) just above the bar
             local frac = curPart / (lastPart + 1)
             mon.setBackgroundColour(colours.lightGrey)
             mon.setCursorPos(1, MH - 1)
@@ -1470,7 +1404,7 @@ local function play(NAME)
             pausedAt = os.epoch("utc")
             drawPauseBar(true)
         else
-            start = start + (os.epoch("utc") - pausedAt)   -- slide schedule
+            start = start + (os.epoch("utc") - pausedAt)
             drawPauseBar(false)
             if cachedFrame then render(cachedFrame, cachedGlyphs) end
         end
@@ -1486,7 +1420,6 @@ local function play(NAME)
 
     local function handleTouch(x, y)
         if not start then
-            -- buffering: only the CANCEL chip acts
             if inRect(cancelRect, x, y) then abortPlay = true end
             return
         end
@@ -1494,7 +1427,7 @@ local function play(NAME)
             if inRect(menuRect, x, y) then
                 abortPlay = true
             else
-                setPaused(false)         -- RESUME chip or anywhere else
+                setPaused(false)
             end
         else
             setPaused(true)
@@ -1517,14 +1450,12 @@ local function play(NAME)
         if sp then pcall(sp.stop) end
     end
 
-    -- ---------- prefill ----------
     local lastB, lastT = -1, os.clock()
     while not abortPlay and nextPart <= lastPart and bufferedAhead() < PREFILL do
         pump(PREFILL)
         local b = bufferedAhead()
         if b ~= lastB then lastB, lastT = b, os.clock() end
         uiStatusThrottled("buffering")
-        -- disk full / tunnel stalled but enough buffered? just start playing
         if (os.clock() - lastT > 5 or fs.getFreeSpace("") < 1500000) and b >= PART_LOW then
             break
         end
@@ -1539,7 +1470,6 @@ local function play(NAME)
         return
     end
 
-    -- ---------- record reader ----------
     local function nextRecord()
         while true do
             if not hnd then
@@ -1551,7 +1481,7 @@ local function play(NAME)
                 if abortPlay then return nil end
                 hnd = fs.open(pname(curPart), "rb")
                 if curPart > 0 and fs.exists(pname(curPart - 1)) then
-                    fs.delete(pname(curPart - 1))   -- free watched parts
+                    fs.delete(pname(curPart - 1))
                 end
             end
             local t = hnd.read()
@@ -1572,7 +1502,6 @@ local function play(NAME)
         end
     end
 
-    -- ---------- main loop ----------
     local lastIter = os.clock()
     while not abortPlay do
         local t, payload = nextRecord()
@@ -1586,8 +1515,6 @@ local function play(NAME)
             if t ~= 0 then
                 cachedFrame = (t == 3) and decodeRLE(payload) or decodePacked(payload)
                 if MODE == 2 then
-                    -- shade frames carry their glyph stream as a type-5
-                    -- record immediately after the colour record
                     local g5, g5payload = nextRecord()
                     if g5 == 5 and not abortPlay then
                         local sub = g5payload:byte(1)
@@ -1598,7 +1525,6 @@ local function play(NAME)
                 end
             end
             if not start then start = os.epoch("utc") + 150 end
-            -- hold the picture to the real-time schedule
             while not abortPlay do
                 if not paused and os.epoch("utc") >= start + fi * frameDur then break end
                 pump(PART_LOW)
@@ -1615,9 +1541,6 @@ local function play(NAME)
             end
         end
 
-        -- audio goes out only when BOTH hold (+-120ms slop):
-        --   its real-time slot (+user delay) arrived
-        --   the picture has rendered up to that point
         while #pendingAudio > 0 and sp and start and not paused do
             local due = start + ai * 250 + DELAY_MS
             if os.epoch("utc") < due - 120 then break end
@@ -1632,7 +1555,6 @@ local function play(NAME)
         lastIter = nowC
     end
 
-    -- flush any audio left at the end so the finale isn't silent
     if not abortPlay then
         while #pendingAudio > 0 and sp do
             playAudioChunk(table.remove(pendingAudio, 1))
@@ -1645,7 +1567,6 @@ local function play(NAME)
     mon.clear()
 end
 
--- ---------- boot ----------
 local argName = ...
 if argName and #argName > 0 then
     play(argName)
@@ -1656,7 +1577,6 @@ if argName and #argName > 0 then
     return
 end
 
--- splash: logo slides in with a shimmer sweep and a jingle
 if MW >= 32 then
     mon.setBackgroundColour(colours.black)
     mon.clear()
@@ -1666,7 +1586,6 @@ if MW >= 32 then
         mon.setBackgroundColour(colours.black)
         mon.clear()
         drawLogo(math.max(2, math.floor(x)), ly)
-        -- shimmer line sweeping under the logo
         local sh = math.floor((x * 7) % (MW - 8)) + 2
         mon.setBackgroundColour(colours.cyan)
         mon.setCursorPos(sh, ly + 6)
@@ -1682,7 +1601,7 @@ pcall(function() bootScale = mon.getTextScale() end)
 local movies, online = fetchMovies()
 while true do
     local it = homeMenu(movies, online)
-    while it.kind == "_refresh" do       -- refresh loops back into the menu
+    while it.kind == "_refresh" do
         blinds()
         movies, online = fetchMovies()
         showToast(online and "Library refreshed" or "Offline - cached list")
