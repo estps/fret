@@ -124,36 +124,70 @@ local function box(x0, y0, w, h, borderColour)
     mon.write("+" .. string.rep("-", w - 2) .. "+")
 end
 
-local CARD_W, CARD_H, GAP = 17, 8, 2
-local HEADER_ROWS = 4
+local GLYPH = {
+    C = { " ### ", "#   #", "#    ", "#   #", " ### " },
+    T = { "#####", "  #  ", "  #  ", "  #  ", "  #  " },
+    V = { "#   #", "#   #", "#   #", " # # ", "  #  " },
+}
+
+local function drawGlyph(ch, x, y, c)
+    local g = GLYPH[ch]
+    mon.setBackgroundColour(c)
+    for r = 1, 5 do
+        for i = 1, 5 do
+            if g[r]:sub(i, i) == "#" then
+                mon.setCursorPos(x + i - 1, y + r - 1)
+                mon.write(" ")
+            end
+        end
+    end
+    mon.setBackgroundColour(colours.black)
+end
+
+local function drawLogo(x, y)
+    local cx = x
+    drawGlyph("C", cx, y, colours.lime);     cx = cx + 6
+    drawGlyph("C", cx, y, colours.lime);     cx = cx + 7
+    drawGlyph("T", cx, y, colours.cyan);     cx = cx + 6
+    drawGlyph("V", cx, y, colours.cyan)
+    mon.setBackgroundColour(colours.black)
+end
+
+local CARD_W, CARD_H, GAP = 17, 9, 2
+local HEADER_ROWS = 8
 local ACCENTS = { colours.lime, colours.cyan, colours.purple, colours.orange,
                   colours.lightBlue, colours.pink }
 
 local function drawCard(it, idx, cx, cy, selected)
+    local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
+    mon.setBackgroundColour(colours.lightGrey)
+    mon.setCursorPos(cx, cy)
+    mon.write(string.rep(" ", CARD_W))
     mon.setBackgroundColour(selected and colours.blue or colours.grey)
-    for r = 0, CARD_H - 1 do
+    for r = 1, CARD_H - 2 do
         mon.setCursorPos(cx, cy + r)
         mon.write(string.rep(" ", CARD_W))
     end
-    local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
-    local ini = it.label:match("%a")
-    ini = ini and ini:upper() or "#"
-    chip(cx + 1, cy + 1, "     ", acc, colours.black)
-    chip(cx + 1, cy + 2, "  " .. ini .. "  ", acc, colours.black)
-    chip(cx + 1, cy + 3, "     ", acc, colours.black)
+    mon.setBackgroundColour(acc)
+    for r = 2, CARD_H - 2 do
+        mon.setCursorPos(cx, cy + r)
+        mon.write("  ")
+    end
     mon.setTextColour(selected and colours.white or colours.lightBlue)
-    local t1 = it.label:sub(1, CARD_W - 2)
-    local t2 = #it.label > CARD_W - 2 and it.label:sub(CARD_W - 1, CARD_W * 2 - 4) or (it.sub or "")
-    mon.setCursorPos(cx + 1, cy + 5)
-    mon.write(t1)
-    if t2 ~= "" then
-        mon.setTextColour(selected and colours.white or colours.lightGrey)
-        mon.setCursorPos(cx + 1, cy + 6)
-        mon.write(t2:sub(1, CARD_W - 2))
+    mon.setCursorPos(cx + 3, cy + 2)
+    mon.write(it.label:sub(1, CARD_W - 4))
+    local sub = #it.label > CARD_W - 4 and it.label:sub(CARD_W - 3, CARD_W * 2 - 6) or (it.sub or "")
+    if sub ~= "" then
+        mon.setTextColour(selected and colours.lightBlue or colours.lightGrey)
+        mon.setCursorPos(cx + 3, cy + 3)
+        mon.write(sub:sub(1, CARD_W - 4))
     end
-    if selected then
-        chip(cx + 1, cy + CARD_H - 1, string.rep(" ", CARD_W - 2), colours.yellow, colours.black)
-    end
+    mon.setTextColour(colours.lightGrey)
+    mon.setCursorPos(cx + CARD_W - 7, cy + CARD_H - 3)
+    mon.write(it.kind == "settings" and "SYSTEM" or "MOVIE")
+    mon.setBackgroundColour(selected and colours.yellow or colours.lightGrey)
+    mon.setCursorPos(cx, cy + CARD_H - 1)
+    mon.write(string.rep(" ", CARD_W))
     mon.setBackgroundColour(colours.black)
 end
 
@@ -168,24 +202,17 @@ local function homeMenu(movies)
     local function drawChrome()
         mon.setBackgroundColour(colours.black)
         mon.clear()
-        mon.setTextColour(colours.lime)
-        mon.setCursorPos(2, 1)
-        mon.write("\127")
-        mon.setTextColour(colours.white)
-        mon.write(" CC TV")
-        mon.setTextColour(colours.lightGrey)
-        mon.write("  v3")
-        local c = clockStr()
-        if c ~= "" then
+        drawLogo(2, 1)
+        if clockStr() ~= "" then
             mon.setTextColour(colours.lightBlue)
-            mon.setCursorPos(math.max(1, MW - #c + 1), 1)
-            mon.write(c)
+            mon.setCursorPos(math.max(1, MW - #clockStr() + 1), 5)
+            mon.write(clockStr())
         end
         mon.setTextColour(colours.lightGrey)
-        mon.setCursorPos(2, 2)
+        mon.setCursorPos(2, 6)
         mon.write(string.rep("\127", MW - 2))
         mon.setTextColour(colours.white)
-        mon.setCursorPos(2, 3)
+        mon.setCursorPos(2, 7)
         mon.write("YOUR MOVIES")
         mon.setTextColour(colours.lightGrey)
         mon.write("  " .. tostring(#movies))
@@ -292,6 +319,7 @@ local function settingsScreen()
         mon.setBackgroundColour(colours.lightGrey)
         mon.setCursorPos(px + 4, railY)
         mon.write(string.rep(" ", rw))
+        chip(px + 4 + math.floor(rw / 2), railY, " ", colours.black, colours.white)
         local bx2 = px + 4 + math.min(rw - 1, math.floor(rw * frac))
         chip(bx2, railY, " ", colours.yellow, colours.black)
         mon.setBackgroundColour(colours.black)
@@ -360,7 +388,7 @@ end
 
 local function play(NAME)
     for _, f in ipairs(fs.list("")) do
-        if f:match("%.ccm%.%d+$") then fs.delete(f) end
+        if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then fs.delete(f) end
     end
 
     local function pname(i) return NAME .. ".ccm." .. i end
@@ -392,13 +420,20 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local dlCur = 0
-    local dl = nil
+    local MAXDL = 2
+    local nextPart = 0
+    local dls = {}
 
     local function bufferedAhead()
         local total = 0
-        for i = 0, dlCur - 1 do
-            if fs.exists(pname(i)) then total = total + fs.getSize(pname(i)) end
+        for i = 0, nextPart - 1 do
+            local f = pname(i)
+            if fs.exists(f) then
+                total = total + fs.getSize(f)
+            else
+                f = f .. ".part"
+                if fs.exists(f) then total = total + fs.getSize(f) end
+            end
         end
         return total
     end
@@ -415,12 +450,12 @@ local function play(NAME)
     local abortPlay = false
 
     local function closeDl()
-        if dl then
-            pcall(function() dl.fh.close() end)
-            pcall(function() dl.res.close() end)
-            pcall(fs.delete, pname(dl.idx))
-            dl = nil
+        for _, d in ipairs(dls) do
+            pcall(function() d.fh.close() end)
+            pcall(function() d.res.close() end)
+            pcall(fs.delete, d.tmp)
         end
+        dls = {}
     end
 
     local lastUiDraw = 0
@@ -485,8 +520,10 @@ local function play(NAME)
             local el = os.clock() - speedT0
             local rate = el > 0.5 and (b - speedB0) / el or 0
             local stats
-            if rate > 0 then
-                stats = ("%.1f/%.1fMB  %.1fMB/s"):format(b / 1000000, PREFILL / 1000000, rate / 1000000)
+            if rate > 1 then
+                local eta = math.min(999, math.ceil((PREFILL - b) / rate))
+                stats = ("%.1f/%.1fMB  %.1fMB/s  ETA %ds")
+                    :format(b / 1000000, PREFILL / 1000000, rate / 1000000, eta)
             else
                 stats = ("%.1f/%.1fMB"):format(b / 1000000, PREFILL / 1000000)
             end
@@ -512,27 +549,34 @@ local function play(NAME)
     end
 
     local function pump(target)
-        if dl then
-            local piece = dl.res.read(16384)
+        local k = 1
+        while k <= #dls do
+            local d = dls[k]
+            local piece = d.res.read(16384)
             if piece then
-                dl.fh.write(piece)
+                d.fh.write(piece)
+                k = k + 1
             else
-                dl.fh.close()
-                dl.res.close()
-                dl = nil
+                d.fh.close()
+                d.res.close()
+                if fs.exists(d.tmp) then
+                    pcall(fs.move, d.tmp, pname(d.idx))
+                end
+                table.remove(dls, k)
             end
-            return
         end
-        if dlCur <= lastPart and bufferedAhead() < target and fs.getFreeSpace("") > 1500000 then
-            local res, err = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(dlCur)), nil, true)
+        while #dls < MAXDL and nextPart <= lastPart
+             and bufferedAhead() < target and fs.getFreeSpace("") > 1500000 do
+            local res, err = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
             if not res then
                 print("part dl failed: " .. tostring(err) .. ", retrying")
                 sleep(2)
-                return
+                break
             end
-            local fh = fs.open(pname(dlCur), "wb")
-            dl = { idx = dlCur, res = res, fh = fh }
-            dlCur = dlCur + 1
+            local tmp = pname(nextPart) .. ".part"
+            local fh = fs.open(tmp, "wb")
+            dls[#dls + 1] = { idx = nextPart, res = res, fh = fh, tmp = tmp }
+            nextPart = nextPart + 1
         end
     end
 
@@ -707,7 +751,7 @@ local function play(NAME)
     end
 
     local lastB, lastT = -1, os.clock()
-    while not abortPlay and dlCur <= lastPart and bufferedAhead() < PREFILL do
+    while not abortPlay and nextPart <= lastPart and bufferedAhead() < PREFILL do
         pump(PREFILL)
         local b = bufferedAhead()
         if b ~= lastB then lastB, lastT = b, os.clock() end
