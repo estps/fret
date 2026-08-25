@@ -1,8 +1,8 @@
 local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 
 local PART_LOW = 4000000
-local PREFILL = 10000000
-local MAX_BUF = 10000000
+local PREFILL = 8000000
+local MAX_BUF = 8000000
 local IDLE_SAVER = 75
 
 local SETTINGS_FILE = ".cctv_settings"
