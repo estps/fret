@@ -83,6 +83,16 @@ end
 print(("Buffer storage: %d disk(s), %.1f MB free")
     :format(#DISKS, totalFree() / 1000000))
 
+-- throttled debug log for the PC terminal: repeats of the same message are
+-- suppressed for 2s so the console stays readable
+local lastDbgMsg, lastDbgT = "", 0
+local function dbg(msg)
+    local now = os.clock()
+    if msg == lastDbgMsg and now - lastDbgT < 2 then return end
+    lastDbgMsg, lastDbgT = msg, now
+    print("[dbg] " .. msg)
+end
+
 local savedPal = {}
 for i = 0, 15 do
     local ok, c1, c2, c3 = pcall(mon.getPaletteColour, 2 ^ i)
@@ -1052,7 +1062,8 @@ local function play(NAME)
 
     -- stripe parts across every available disk, round-robin
     local function diskOf(i) return DISKS[(i % #DISKS) + 1] end
-    local function pname(i) return diskOf(i) .. "/" .. NAME .. ".ccm." .. i end
+    local function rname(i) return NAME .. ".ccm." .. i end
+    local function pname(i) return diskOf(i) .. "/" .. rname(i) end
     local enc = urlencode(NAME)
 
     print("Fetching " .. NAME .. "...")
@@ -1310,7 +1321,11 @@ local function play(NAME)
                 if fs.exists(d.tmp) then
                     pcall(fs.move, d.tmp, pname(d.idx))
                     local okSz, sz = pcall(fs.getSize, pname(d.idx))
-                    if okSz and type(sz) == "number" then lastPartSz = sz end
+                    if okSz and type(sz) == "number" then
+                        lastPartSz = sz
+                        dbg(("part %d complete (%.2f MB on %s)")
+                            :format(d.idx, sz / 1000000, diskOf(d.idx)))
+                    end
                 end
                 table.remove(dls, k)
             end
@@ -1331,13 +1346,31 @@ local function play(NAME)
         -- will still fit under MAX_BUF - aborted partials are pure waste,
         -- so it's far better to wait than to start one that gets killed
         local est = lastPartSz > 0 and lastPartSz or 2500000
+        local b = bufferedAhead()
+        if #dls < MAXDL and nextPart <= lastPart then
+            local why
+            if b + est > MAX_BUF then
+                why = ("headroom wait: buf %.2f + est %.2f > cap %.2f MB")
+                    :format(b / 1e6, est / 1e6, MAX_BUF / 1e6)
+            elseif b >= math.min(target, MAX_BUF) then
+                why = ("target reached: buf %.2f MB"):format(b / 1e6)
+            elseif fs.getFreeSpace(diskOf(nextPart)) <= 1500000 then
+                why = ("disk '%s' full (%.2f MB free)")
+                    :format(diskOf(nextPart), fs.getFreeSpace(diskOf(nextPart)) / 1e6)
+            elseif os.clock() - lastDlFail <= 0.5 then
+                why = "retry cooldown"
+            end
+            if why then dbg(why) end
+        end
         if #dls < MAXDL and nextPart <= lastPart
-             and bufferedAhead() + est <= MAX_BUF
-             and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace(diskOf(nextPart)) > 1500000
+             and b + est <= MAX_BUF
+             and b < math.min(target, MAX_BUF) and fs.getFreeSpace(diskOf(nextPart)) > 1500000
              and os.clock() - lastDlFail > 0.5 then
-            local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
+            dbg(("GET %s -> %s"):format(rname(nextPart), diskOf(nextPart)))
+            local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(rname(nextPart)), nil, true)
             if not res2 then
                 lastDlFail = os.clock()
+                print("[dbg] HTTP FAIL part " .. nextPart .. ": " .. tostring(err2))
                 return
             end
             local tmp = pname(nextPart) .. ".part"
