@@ -1,24 +1,11 @@
 -- ComputerCraft door controller
 -- Connects to the python voice server through your cloudflare tunnel.
 -- Edit TUNNEL_URL to the https://...xxx.trycloudflare.com URL cloudflared prints.
--- Set SIDES to the sides THIS computer controls (comma-separated).
---
--- Computer 1: SIDES = "back,top,left,right"
--- Computer 2: SIDES = "bottom"
+-- Set PC_NUMBER to this computer's number (1 or 2).
 
 local TUNNEL_URL = "wss://thread-spoke-ratings-phpbb.trycloudflare.com"
-local SIDES = "bottom"         -- comma-separated sides this computer controls
+local PC_NUMBER = 1           -- THIS IS THE ONLY THING YOU CHANGE
 local PULSE_TIME = 2.0
-
-local function parse_sides(s)
-    local t = {}
-    for side in s:gmatch("[^,]+") do
-        t[side:match("^%s*(.-)%s*$")] = true
-    end
-    return t
-end
-
-local my_sides = parse_sides(SIDES)
 
 local function connect()
     while true do
@@ -31,20 +18,21 @@ local function connect()
     end
 end
 
-print("door controller starting (sides: " .. SIDES .. ")")
+print("PC " .. PC_NUMBER .. " starting")
 
 while true do
     local ws = connect()
     print("connected to server")
 
-    ws.send('{"hello":"' .. SIDES .. '"}')
+    -- tell the server which PC we are
+    ws.send('{"pc":' .. PC_NUMBER .. '}')
 
     while true do
         local msg = ws.receive()
         if not msg then break end
 
         local data = textutils.unserialiseJSON(msg)
-        if data and data.action == "pulse" and my_sides[data.side] then
+        if data and data.action == "pulse" then
             print("pulsing " .. data.side .. "!")
             redstone.setOutput(data.side, true)
             sleep(data.duration or PULSE_TIME)
