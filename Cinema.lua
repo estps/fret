@@ -1060,10 +1060,21 @@ end
 local function play(NAME)
     sweepBuffers()
 
-    -- stripe parts across every available disk, round-robin
-    local function diskOf(i) return DISKS[(i % #DISKS) + 1] end
+    -- stripe parts across every available disk: each new part lands on
+    -- whichever disk currently has the most free space
+    local partDisk = {}
+    local function diskFor(i)
+        if partDisk[i] then return partDisk[i] end
+        local best, bestFree = DISKS[1], -1
+        for _, d in ipairs(DISKS) do
+            local f = fs.getFreeSpace(d)
+            if f > bestFree then best, bestFree = d, f end
+        end
+        partDisk[i] = best
+        return best
+    end
     local function rname(i) return NAME .. ".ccm." .. i end
-    local function pname(i) return diskOf(i) .. "/" .. rname(i) end
+    local function pname(i) return diskFor(i) .. "/" .. rname(i) end
     local enc = urlencode(NAME)
 
     print("Fetching " .. NAME .. "...")
@@ -1324,7 +1335,7 @@ local function play(NAME)
                     if okSz and type(sz) == "number" then
                         lastPartSz = sz
                         dbg(("part %d complete (%.2f MB on %s)")
-                            :format(d.idx, sz / 1000000, diskOf(d.idx)))
+                            :format(d.idx, sz / 1000000, diskFor(d.idx)))
                     end
                 end
                 table.remove(dls, k)
@@ -1354,19 +1365,24 @@ local function play(NAME)
                     :format(b / 1e6, est / 1e6, MAX_BUF / 1e6)
             elseif b >= math.min(target, MAX_BUF) then
                 why = ("target reached: buf %.2f MB"):format(b / 1e6)
-            elseif fs.getFreeSpace(diskOf(nextPart)) <= 1500000 then
-                why = ("disk '%s' full (%.2f MB free)")
-                    :format(diskOf(nextPart), fs.getFreeSpace(diskOf(nextPart)) / 1e6)
-            elseif os.clock() - lastDlFail <= 0.5 then
-                why = "retry cooldown"
+            else
+                local tgt = diskFor(nextPart)
+                local freeTgt = fs.getFreeSpace(tgt)
+                if freeTgt <= est + 200000 then
+                    why = ("no disk room: best '%s' has %.2f MB free, part needs %.2f MB")
+                        :format(tgt == "" and "<root>" or tgt, freeTgt / 1e6, (est + 200000) / 1e6)
+                elseif os.clock() - lastDlFail <= 0.5 then
+                    why = "retry cooldown"
+                end
             end
             if why then dbg(why) end
         end
         if #dls < MAXDL and nextPart <= lastPart
              and b + est <= MAX_BUF
-             and b < math.min(target, MAX_BUF) and fs.getFreeSpace(diskOf(nextPart)) > 1500000
+             and b < math.min(target, MAX_BUF)
+             and fs.getFreeSpace(diskFor(nextPart)) > est + 200000
              and os.clock() - lastDlFail > 0.5 then
-            dbg(("GET %s -> %s"):format(rname(nextPart), diskOf(nextPart)))
+            dbg(("GET %s -> %s"):format(rname(nextPart), diskFor(nextPart)))
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(rname(nextPart)), nil, true)
             if not res2 then
                 lastDlFail = os.clock()
