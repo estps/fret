@@ -1107,6 +1107,7 @@ local function play(NAME)
     local nextPart = 0
     local dls = {}
     local lastDlFail = 0
+    local lastPartSz = 0
 
     local bufCache, bufAt = 0, 0
     local function bufferedAhead()
@@ -1268,6 +1269,8 @@ local function play(NAME)
                 d.res.close()
                 if fs.exists(d.tmp) then
                     pcall(fs.move, d.tmp, pname(d.idx))
+                    local okSz, sz = pcall(fs.getSize, pname(d.idx))
+                    if okSz and type(sz) == "number" then lastPartSz = sz end
                 end
                 table.remove(dls, k)
             end
@@ -1284,7 +1287,12 @@ local function play(NAME)
             pcall(fs.delete, d.tmp)
             nextPart = d.idx          -- re-request this part once below the cap
         end
+        -- headroom check: never START a download unless the finished part
+        -- will still fit under MAX_BUF - aborted partials are pure waste,
+        -- so it's far better to wait than to start one that gets killed
+        local est = lastPartSz > 0 and lastPartSz or 5000000
         if #dls < MAXDL and nextPart <= lastPart
+             and bufferedAhead() + est <= MAX_BUF
              and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace("") > 1500000
              and os.clock() - lastDlFail > 0.5 then
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
