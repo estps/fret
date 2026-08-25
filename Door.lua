@@ -32,10 +32,11 @@ while true do
 
         local data = textutils.unserialiseJSON(msg)
         if data and data.action == "pulse" then
-            print("opening door!")
-            redstone.setOutput(SIDE, true)
+            local side = data.side or SIDE
+            print("pulsing " .. side .. "!")
+            redstone.setOutput(side, true)
             sleep(data.duration or PULSE_TIME)
-            redstone.setOutput(SIDE, false)
+            redstone.setOutput(side, false)
             ws.send('{"status":"done"}')
         end
     end
