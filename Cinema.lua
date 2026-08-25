@@ -1103,7 +1103,7 @@ local function play(NAME)
     -- small safety margin; PLAY_AHEAD stays one part below MAX_BUF so
     -- downloads finish instead of being aborted at the ceiling
     MAX_BUF = math.max(MAX_BUF, totalFree() - 3000000)
-    PLAY_AHEAD = math.max(PLAY_AHEAD, MAX_BUF - 2500000)
+    PLAY_AHEAD = math.max(PLAY_AHEAD, MAX_BUF - 1200000)
     PREFILL = math.max(PART_LOW, math.floor(MAX_BUF * 0.6))
 
     if PIXEL then
@@ -1345,7 +1345,7 @@ local function play(NAME)
         -- headroom check: never START a download unless the finished part
         -- will still fit under MAX_BUF - aborted partials are pure waste,
         -- so it's far better to wait than to start one that gets killed
-        local est = lastPartSz > 0 and lastPartSz or 2500000
+        local est = lastPartSz > 0 and lastPartSz or 1000000
         local b = bufferedAhead()
         if #dls < MAXDL and nextPart <= lastPart then
             local why
