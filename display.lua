@@ -1164,6 +1164,7 @@ local function play(NAME)
     end
 
     local bufCache, bufAt = 0, 0
+    local curPart = 0
     local function bufferedAhead()
         -- walking every part with fs.getSize is expensive on long movies,
         -- so serve a quarter-second-stale cached value instead
@@ -1188,7 +1189,6 @@ local function play(NAME)
     local pendingAudio = {}
     local cachedFrame
     local cachedGlyphs
-    local curPart = 0
     local hnd = nil
     local paused = false
     local pausedAt = nil
