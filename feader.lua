@@ -71,7 +71,23 @@ local function logInventoryIfStuck()
     local now = os.clock()
     if now - lastInvLog > 15 then
         lastInvLog = now
-        logStorage()
+logStorage()
+
+-- boot wipe: clear every .ccm part and temp file from all disks so each
+-- session starts with clean storage
+local wiped = 0
+for _, d in ipairs(DISKS) do
+    for _, f in ipairs(fs.list(d)) do
+        if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") or f:match("%.meta$") then
+            fs.delete(fs.combine(d, f))
+            wiped = wiped + 1
+        end
+    end
+end
+if wiped > 0 then
+    dbg(("boot wipe: removed %d stale file(s), %.1f MB free now")
+        :format(wiped, totalFree() / 1e6))
+end
     end
 end
 
