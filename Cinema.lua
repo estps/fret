@@ -5,6 +5,7 @@ local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 local PART_LOW = 4000000
 local PREFILL = 8000000
 local MAX_BUF = 8000000
+local PLAY_AHEAD = 7500000
 local IDLE_SAVER = 75
 
 local SETTINGS_FILE = ".cctv_settings"
@@ -1102,7 +1103,7 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local MAXDL = 3
+    local MAXDL = 4
     local nextPart = 0
     local dls = {}
     local lastDlFail = 0
@@ -1647,7 +1648,7 @@ local function play(NAME)
         while true do
             if not hnd then
                 while not abortPlay and not fs.exists(pname(curPart)) do
-                    pump(PART_LOW)
+                    pump(PLAY_AHEAD)
                     uiStatusThrottled("rebuffering")
                     waitEvents(0.05)
                 end
@@ -1702,7 +1703,7 @@ local function play(NAME)
                     if not start then start = os.epoch("utc") + 150 end
                     while not abortPlay do
                         if not paused and os.epoch("utc") >= start + fi * frameDur then break end
-                        pump(PART_LOW)
+                        pump(PLAY_AHEAD)
                         waitEvents(paused and 0.15 or 0.02)
                         if paused then
                             eqTick = eqTick + 1
@@ -1735,7 +1736,7 @@ local function play(NAME)
             if not start then start = os.epoch("utc") + 150 end
             while not abortPlay do
                 if not paused and os.epoch("utc") >= start + fi * frameDur then break end
-                pump(PART_LOW)
+                pump(PLAY_AHEAD)
                 waitEvents(paused and 0.15 or 0.02)
                 if paused then
                     eqTick = eqTick + 1
@@ -1760,7 +1761,7 @@ local function play(NAME)
             ai = ai + 1
         end
 
-        pump(PART_LOW)
+        pump(PLAY_AHEAD)
         local nowC = os.clock()
         if nowC - lastIter < 0.004 then sleep(0.005) end
         lastIter = nowC
