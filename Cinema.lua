@@ -1166,10 +1166,11 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local MAXDL = 3
+    local MAXDL = 8
     local nextPart = 0
     local dls = {}
     local lastDlFail = 0
+    local lastGc = 0
     local lastPartSz = 0
 
     local bufCache, bufAt = 0, 0
@@ -1360,6 +1361,28 @@ local function play(NAME)
         -- hard ceiling: abort newest in-flight downloads while over MAX_BUF
         -- (finished parts + .part files both count toward bufferedAhead())
         bufAt = 0
+        bufAt = 0
+        -- garbage collection: delete every part behind the playhead from
+        -- every disk, so consumed footage ALWAYS frees space for new
+        -- downloads (the per-part delete in nextRecord can miss)
+        local nowC = os.clock()
+        if nowC - lastGc > 3 then
+            lastGc = nowC
+            local removed = 0
+            for _, dsk in ipairs(DISKS) do
+                for _, f in ipairs(fs.list(dsk)) do
+                    local num = f:match("%.ccm%.(%d+)$")
+                    if num and tonumber(num) < curPart then
+                        fs.delete(fs.combine(dsk, f))
+                        removed = removed + 1
+                    end
+                end
+            end
+            if removed > 0 then
+                bufAt = 0
+                dbg(("gc: freed %d played part(s)"):format(removed))
+            end
+        end
         while #dls > 0 and bufferedAhead() >= MAX_BUF do
             local d = table.remove(dls)
             pcall(function() d.res.close() end)
