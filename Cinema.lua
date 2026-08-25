@@ -44,6 +44,14 @@ local mon = peripheral.find("monitor")
 if not mon then error("No monitor attached", 0) end
 mon.setTextScale(0.5)
 
+local GFX = (mon.setGraphicsMode ~= nil)
+local GFX_W, GFX_H = 0, 0
+if GFX then
+    mon.setGraphicsMode(2)
+    GFX_W, GFX_H = mon.getSize()
+    mon.setGraphicsMode(0)
+end
+
 local sp = peripheral.find("speaker")
 
 local savedPal = {}
@@ -1030,20 +1038,38 @@ local function play(NAME)
     if not w then error("Corrupt meta file", 0) end
     local nb = tonumber(blk) or 1
     local MODE = tonumber(md) or 0
-    if MODE > 2 then
-        error("movie needs render mode " .. MODE .. ", this player supports 0-2", 0)
+    if MODE > 3 then
+        error("movie needs render mode " .. MODE .. ", this player supports 0-3", 0)
     end
     local HALF = MODE == 1
-    local cw, chh = w * nb, h * nb
+    local PIXEL = MODE == 3 and GFX
+    local cw, chh
+    if MODE == 3 then
+        cw, chh = w, h
+    else
+        cw, chh = w * nb, h * nb
+    end
     local lastPart = partCount - 1
 
     mon.setTextScale(0.5)
     MW, MH = mon.getSize()
-    if math.floor(MW + 0.5) < cw or math.floor(MH + 0.5) < chh then
-        print(("monitor %dx%d too small for %dx%d grid"):format(MW, MH, cw, chh))
+
+    if PIXEL then
+        mon.setGraphicsMode(2)
+        GFX_W, GFX_H = mon.getSize()
+        mon.clear()
+    else
+        if GFX then pcall(mon.setGraphicsMode, 0) end
+        if math.floor(MW + 0.5) < cw or math.floor(MH + 0.5) < chh then
+            print(("monitor %dx%d too small for %dx%d grid"):format(MW, MH, cw, chh))
+        end
     end
 
-    local win = window.create(mon, 1, 1, cw, chh, false)
+    local win = PIXEL and nil or window.create(mon, 1, 1, cw, chh, false)
+
+    local pixelBuf = PIXEL and {} or nil
+    local pixelExpected = PIXEL and (cw * chh * 3) or 0
+    local pixelFc = -1
 
     local function toHex(v)
         if v < 10 then return string.char(48 + v) end
@@ -1245,6 +1271,41 @@ local function play(NAME)
     end
 
     local function render(frame, glyphs)
+        if PIXEL then
+            local rbuf = {}
+            local idx = 0
+            if type(frame) == "string" and #frame > 0 and (string.byte(frame, 1) or 0) > 15 then
+                for i = 1, #frame, 3 do
+                    rbuf[idx + 1] = (string.byte(frame, i) or 0) / 255
+                    rbuf[idx + 2] = (string.byte(frame, i + 1) or 0) / 255
+                    rbuf[idx + 3] = (string.byte(frame, i + 2) or 0) / 255
+                    idx = idx + 3
+                end
+            else
+                for r0 in string.gmatch(frame, "[^;]+") do
+                    for i = 1, #r0 do
+                        local hex = string.byte(r0, i)
+                        local ci
+                        if hex >= 48 and hex <= 57 then ci = hex - 48
+                        elseif hex >= 97 and hex <= 102 then ci = hex - 87
+                        else ci = 0 end
+                        local c = palCur[ci + 1]
+                        if c then
+                            rbuf[idx + 1] = c[1]
+                            rbuf[idx + 2] = c[2]
+                            rbuf[idx + 3] = c[3]
+                        else
+                            rbuf[idx + 1] = 0
+                            rbuf[idx + 2] = 0
+                            rbuf[idx + 3] = 0
+                        end
+                        idx = idx + 3
+                    end
+                end
+            end
+            mon.drawPixels(1, 1, cw, chh, rbuf)
+            return
+        end
         local y = 1
         for r0 in string.gmatch(frame, "[^;]+") do
             if y > chh then break end
@@ -1296,14 +1357,44 @@ local function play(NAME)
         win.setVisible(true)
     end
 
+    local palCur, palTgt = {}, {}
     local function applyPalette(p)
         if not p then return end
         local i = 0
         for entry in p:gmatch("[^;]+") do
             local r, g, b = entry:match("(%d+),(%d+),(%d+)")
             if r and i < 16 then
-                mon.setPaletteColour(2 ^ i, r / 255, g / 255, b / 255)
                 i = i + 1
+                palTgt[i] = { r / 255, g / 255, b / 255 }
+                -- first palette snaps instantly; later ones ease in so a
+                -- palette change repaints as a smooth shift instead of a
+                -- one-frame full-screen colour flash
+                if not palCur[i] then palCur[i] = { r / 255, g / 255, b / 255 } end
+            end
+        end
+    end
+
+    local PAL_EASE = 0.7
+    local function stepPalette()
+        local dirty = false
+        for i = 1, 16 do
+            local c, t = palCur[i], palTgt[i]
+            if c and t then
+                for ch = 1, 3 do
+                    local d = t[ch] - c[ch]
+                    if d > 0.004 or d < -0.004 then
+                        c[ch] = c[ch] + d * PAL_EASE
+                        dirty = true
+                    else
+                        c[ch] = t[ch]
+                    end
+                end
+            end
+        end
+        if dirty then
+            for i = 1, 16 do
+                local c = palCur[i]
+                if c then mon.setPaletteColour(2 ^ (i - 1), c[1], c[2], c[3]) end
             end
         end
     end
@@ -1578,6 +1669,41 @@ local function play(NAME)
             applyPalette(payload)
         elseif t == 4 then
             if sp then pendingAudio[#pendingAudio + 1] = payload end
+        elseif t == 6 then
+            if PIXEL then
+                local header = string.byte(payload, 1) or 0
+                local fc = math.floor(header / 16) % 16
+                local chunk_idx = header % 16
+                if fc ~= pixelFc then
+                    pixelBuf = {}
+                    pixelFc = fc
+                end
+                pixelBuf[chunk_idx + 1] = payload:sub(2)
+                local total = 0
+                for i = 1, #pixelBuf do total = total + #pixelBuf[i] end
+                if total >= pixelExpected then
+                    cachedFrame = table.concat(pixelBuf)
+                    pixelBuf = {}
+                    if not start then start = os.epoch("utc") + 150 end
+                    while not abortPlay do
+                        if not paused and os.epoch("utc") >= start + fi * frameDur then break end
+                        pump(PART_LOW)
+                        waitEvents(paused and 0.15 or 0.02)
+                        if paused then
+                            eqTick = eqTick + 1
+                            drawEQ(eqTick)
+                        end
+                    end
+                    if abortPlay then break end
+                    if not paused then
+                        stepPalette()
+                        render(cachedFrame, nil)
+                        fi = fi + 1
+                    else
+                        stepPalette()
+                    end
+                end
+            end
         elseif t == 0 or t == 2 or t == 3 then
             if t ~= 0 then
                 cachedFrame = (t == 3) and decodeRLE(payload) or decodePacked(payload)
@@ -1603,8 +1729,11 @@ local function play(NAME)
             end
             if abortPlay then break end
             if not paused then
+                stepPalette()
                 render(cachedFrame, cachedGlyphs)
                 fi = fi + 1
+            else
+                stepPalette()
             end
         end
 
@@ -1629,7 +1758,11 @@ local function play(NAME)
     end
 
     cleanup()
-    win.setVisible(false)
+    if PIXEL then
+        pcall(mon.setGraphicsMode, 0)
+    elseif win then
+        win.setVisible(false)
+    end
     mon.setBackgroundColour(colours.black)
     mon.clear()
 end
