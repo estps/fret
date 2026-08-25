@@ -1,6 +1,6 @@
 
 
-local BASE = "https://simple-greene-freight-back.trycloudflare.com"
+local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 
 local PART_LOW = 4000000
 local PREFILL = 7500000
@@ -45,12 +45,6 @@ if not mon then error("No monitor attached", 0) end
 mon.setTextScale(0.5)
 
 local GFX = (mon.setGraphicsMode ~= nil)
-local GFX_W, GFX_H = 0, 0
-if GFX then
-    mon.setGraphicsMode(2)
-    GFX_W, GFX_H = mon.getSize()
-    mon.setGraphicsMode(0)
-end
 
 local sp = peripheral.find("speaker")
 
@@ -1055,9 +1049,7 @@ local function play(NAME)
     MW, MH = mon.getSize()
 
     if PIXEL then
-        mon.setGraphicsMode(2)
-        GFX_W, GFX_H = mon.getSize()
-        mon.clear()
+        GFX_W, GFX_H = cw * 6, chh * 9
     else
         if GFX then pcall(mon.setGraphicsMode, 0) end
         if math.floor(MW + 0.5) < cw or math.floor(MH + 0.5) < chh then
@@ -1070,6 +1062,30 @@ local function play(NAME)
     local pixelBuf = PIXEL and {} or nil
     local pixelExpected = PIXEL and (cw * chh * 3) or 0
     local pixelFc = -1
+    local gfxActive = false
+    local rgbToIdx = nil
+
+    local function initGfx()
+        if gfxActive then return end
+        mon.setGraphicsMode(2)
+        gfxActive = true
+        for ri = 0, 5 do
+            for gi = 0, 5 do
+                for bi = 0, 5 do
+                    local idx = ri * 36 + gi * 6 + bi
+                    mon.setPaletteColour(idx, ri / 5, gi / 5, bi / 5)
+                end
+            end
+        end
+        for i = 0, 39 do
+            local v = i / 39
+            mon.setPaletteColour(216 + i, v, v, v)
+        end
+        rgbToIdx = {}
+        for i = 0, 255 do
+            rgbToIdx[i] = math.min(5, math.floor(i / 255 * 6 + 0.5))
+        end
+    end
 
     local function toHex(v)
         if v < 10 then return string.char(48 + v) end
@@ -1272,38 +1288,19 @@ local function play(NAME)
 
     local function render(frame, glyphs)
         if PIXEL then
-            local rbuf = {}
+            initGfx()
+            local ibuf = {}
             local idx = 0
-            if type(frame) == "string" and #frame > 0 and (string.byte(frame, 1) or 0) > 15 then
-                for i = 1, #frame, 3 do
-                    rbuf[idx + 1] = (string.byte(frame, i) or 0) / 255
-                    rbuf[idx + 2] = (string.byte(frame, i + 1) or 0) / 255
-                    rbuf[idx + 3] = (string.byte(frame, i + 2) or 0) / 255
-                    idx = idx + 3
-                end
-            else
-                for r0 in string.gmatch(frame, "[^;]+") do
-                    for i = 1, #r0 do
-                        local hex = string.byte(r0, i)
-                        local ci
-                        if hex >= 48 and hex <= 57 then ci = hex - 48
-                        elseif hex >= 97 and hex <= 102 then ci = hex - 87
-                        else ci = 0 end
-                        local c = palCur[ci + 1]
-                        if c then
-                            rbuf[idx + 1] = c[1]
-                            rbuf[idx + 2] = c[2]
-                            rbuf[idx + 3] = c[3]
-                        else
-                            rbuf[idx + 1] = 0
-                            rbuf[idx + 2] = 0
-                            rbuf[idx + 3] = 0
-                        end
-                        idx = idx + 3
-                    end
+            if type(frame) == "string" then
+                for i = 1, #frame - 2, 3 do
+                    local r = string.byte(frame, i) or 0
+                    local g = string.byte(frame, i + 1) or 0
+                    local b = string.byte(frame, i + 2) or 0
+                    idx = idx + 1
+                    ibuf[idx] = rgbToIdx[r] * 36 + rgbToIdx[g] * 6 + rgbToIdx[b]
                 end
             end
-            mon.drawPixels(1, 1, cw, chh, rbuf)
+            mon.drawPixels(1, 1, cw, chh, ibuf)
             return
         end
         local y = 1
@@ -1614,7 +1611,8 @@ local function play(NAME)
         local b = bufferedAhead()
         if b ~= lastB then lastB, lastT = b, os.clock() end
         uiStatusThrottled("buffering")
-        if (os.clock() - lastT > 5 or fs.getFreeSpace("") < 1500000) and b >= PART_LOW then
+        if fs.getFreeSpace("") < 3000000 then break end
+        if (os.clock() - lastT > 5) and b >= PART_LOW then
             break
         end
         waitEvents(0.05)
