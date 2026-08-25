@@ -1,5 +1,3 @@
-
-
 local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 
 local PART_LOW = 4000000
@@ -1066,15 +1064,23 @@ local function play(NAME)
     local win = PIXEL and nil or window.create(mon, 1, 1, cw, chh, false)
 
     local pixelBuf = PIXEL and {} or nil
-    local pixelExpected = PIXEL and (cw * chh * 3) or 0
+    local pixelExpected = PIXEL and (cw * chh) or 0
     local pixelFc = -1
     local gfxActive = false
+    local gfxOx, gfxOy = 0, 0
     local rgbToIdx = nil
-
     local function initGfx()
         if gfxActive then return end
         mon.setGraphicsMode(2)
         gfxActive = true
+        -- the monitor's true pixel size can differ slightly from the
+        -- transcoded grid: centre the frame so it doesn't hug the top-left
+        gfxOx, gfxOy = 0, 0
+        local okS, spw, sph = pcall(mon.getSize, 2)
+        if okS and type(spw) == "number" and spw > 0 and type(sph) == "number" and sph > 0 then
+            gfxOx = math.max(0, math.floor((spw - cw) / 2))
+            gfxOy = math.max(0, math.floor((sph - chh) / 2))
+        end
         for ri = 0, 5 do
             for gi = 0, 5 do
                 for bi = 0, 5 do
@@ -1087,10 +1093,6 @@ local function play(NAME)
             local v = i / 39
             pcall(mon.setPaletteColour, 216 + i, v, v, v)
         end
-        rgbToIdx = {}
-        for i = 0, 255 do
-            rgbToIdx[i] = math.min(5, math.floor(i / 255 * 6 + 0.5))
-        end
     end
 
     local function toHex(v)
@@ -1098,7 +1100,7 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local MAXDL = 2
+    local MAXDL = 3
     local nextPart = 0
     local dls = {}
     local lastDlFail = 0
@@ -1295,22 +1297,15 @@ local function play(NAME)
     local function render(frame, glyphs)
         if PIXEL then
             initGfx()
+            -- frames arrive pre-quantised (1 palette index per pixel):
+            -- slicing into rows is all that's left to do per frame
             local rows = {}
             if type(frame) == "string" then
-                local pos = 1
                 for y = 1, chh do
-                    local row = {}
-                    for x = 1, cw do
-                        local r = string.byte(frame, pos) or 0
-                        local g = string.byte(frame, pos + 1) or 0
-                        local b = string.byte(frame, pos + 2) or 0
-                        row[x] = string.char(rgbToIdx[r] * 36 + rgbToIdx[g] * 6 + rgbToIdx[b])
-                        pos = pos + 3
-                    end
-                    rows[y] = table.concat(row)
+                    rows[y] = frame:sub((y - 1) * cw + 1, y * cw)
                 end
             end
-            mon.drawPixels(0, 0, rows)
+            mon.drawPixels(gfxOx, gfxOy, rows)
             return
         end
         local y = 1
