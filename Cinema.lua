@@ -1301,7 +1301,9 @@ local function play(NAME)
                     ibuf[idx] = rgbToIdx[r] * 36 + rgbToIdx[g] * 6 + rgbToIdx[b]
                 end
             end
-            mon.drawPixels(1, 1, cw, chh, ibuf)
+            local s = {}
+            for j = 1, #ibuf do s[j] = string.char(ibuf[j]) end
+            mon.drawPixels(1, 1, cw, chh, table.concat(s))
             return
         end
         local y = 1
