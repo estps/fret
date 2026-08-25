@@ -100,10 +100,17 @@ local function handleStoreMsg(id, msg)
     if type(msg) ~= "table" then return end
     if msg.cmd == "node" and tonumber(msg.free) then
         local n = nodes[id]
-        if not n then n = {} nodes[id] = n end
+        if not n then
+            dbg(("node %d online (%.1f MB free)"):format(id, msg.free / 1e6))
+            n = {}
+            nodes[id] = n
+        end
         n.seen = os.clock()
         n.free = msg.free
     elseif msg.cmd == "done" or msg.cmd == "fail" then
+        if msg.cmd == "fail" then
+            dbg(("node %d FAILED part %s"):format(id, tostring(msg.part)))
+        end
         inflight[msg.part] = nil
         if nodes[id] then nodes[id].busy = nil end
     end
@@ -138,6 +145,7 @@ local function coordTick()
             local id = table.remove(idle)
             nodes[id].busy = i
             inflight[i] = { node = id, t = now }
+            dbg(("assign part %d -> node %d"):format(i, id))
             pcall(rednet.send, id,
                 { cmd = "assign", movie = COORD.movie, part = i }, REDNET_PROTO)
         end
