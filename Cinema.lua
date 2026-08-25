@@ -3,7 +3,8 @@
 local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 
 local PART_LOW = 4000000
-local PREFILL = 7500000
+local PREFILL = 10000000
+local MAX_BUF = 10000000
 local IDLE_SAVER = 75
 
 local SETTINGS_FILE = ".cctv_settings"
@@ -1092,7 +1093,7 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local MAXDL = 4
+    local MAXDL = 2
     local nextPart = 0
     local dls = {}
     local lastDlFail = 0
@@ -1264,7 +1265,7 @@ local function play(NAME)
         -- failed requests retry at most twice a second: sleeping here would
         -- freeze the render loop and drop frames
         if #dls < MAXDL and nextPart <= lastPart
-             and bufferedAhead() < target and fs.getFreeSpace("") > 1500000
+             and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace("") > 1500000
              and os.clock() - lastDlFail > 0.5 then
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
             if not res2 then
