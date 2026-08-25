@@ -116,7 +116,12 @@ local function partPath(movie, i)
     end
 end
 
-local function handleStoreMsg(id, msg)
+local function handleStoreMsg(id, raw)
+    -- raw rednet_message events deliver the protocol envelope still wrapped
+    -- ({sProtocol=..., tMessage=...}) - unwrap it ourselves
+    if type(raw) ~= "table" then return end
+    if raw.sProtocol ~= REDNET_PROTO then return end
+    local msg = raw.tMessage or raw.sPayload
     if type(msg) ~= "table" then return end
     if msg.cmd == "node" and tonumber(msg.free) then
         local n = nodes[id]
