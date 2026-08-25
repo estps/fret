@@ -1295,20 +1295,22 @@ local function play(NAME)
     local function render(frame, glyphs)
         if PIXEL then
             initGfx()
-            local ibuf = {}
-            local idx = 0
+            local rows = {}
             if type(frame) == "string" then
-                for i = 1, #frame - 2, 3 do
-                    local r = string.byte(frame, i) or 0
-                    local g = string.byte(frame, i + 1) or 0
-                    local b = string.byte(frame, i + 2) or 0
-                    idx = idx + 1
-                    ibuf[idx] = rgbToIdx[r] * 36 + rgbToIdx[g] * 6 + rgbToIdx[b]
+                local pos = 1
+                for y = 1, chh do
+                    local row = {}
+                    for x = 1, cw do
+                        local r = string.byte(frame, pos) or 0
+                        local g = string.byte(frame, pos + 1) or 0
+                        local b = string.byte(frame, pos + 2) or 0
+                        row[x] = string.char(rgbToIdx[r] * 36 + rgbToIdx[g] * 6 + rgbToIdx[b])
+                        pos = pos + 3
+                    end
+                    rows[y] = table.concat(row)
                 end
             end
-            local s = {}
-            for j = 1, #ibuf do s[j] = string.char(ibuf[j]) end
-            mon.drawPixels(1, 1, cw, chh, table.concat(s))
+            mon.drawPixels(0, 0, rows)
             return
         end
         local y = 1
