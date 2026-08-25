@@ -67,16 +67,36 @@ local function totalFree()
     return t
 end
 
--- rednet link to feader.lua (any modem on the wired/wireless network)
+-- rednet link to storage nodes (any modem on the network)
 local REDNET_PROTO = "ccplayer"
+local anyModem = false
 for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == "modem" and not rednet.isOpen(name) then
-        pcall(rednet.open, name)
+    if peripheral.getType(name) == "modem" then
+        anyModem = true
+        if not rednet.isOpen(name) then
+            local ok, err = pcall(rednet.open, name)
+            if not ok then print("rednet.open failed: " .. tostring(err)) end
+        end
     end
+end
+if anyModem then
+    print("Rednet: open (" .. tostring(rednet.isOpen(peripheral.getNames()[1] or "")) .. ")")
+else
+    print("Rednet: NO MODEM FOUND - storage PCs cannot be reached!")
 end
 
 local function tellFeader(msg)
     pcall(rednet.broadcast, msg, REDNET_PROTO)
+end
+
+-- throttled debug log for the PC terminal: repeats of the same message are
+-- suppressed for 2s so the console stays readable
+local lastDbgMsg, lastDbgT = "", 0
+local function dbg(msg)
+    local now = os.clock()
+    if msg == lastDbgMsg and now - lastDbgT < 2 then return end
+    lastDbgMsg, lastDbgT = msg, now
+    print("[dbg] " .. msg)
 end
 
 -- ------------------------------------------------ distributed coordination
@@ -161,16 +181,6 @@ local function sweepBuffers()
             end
         end
     end
-end
-
--- throttled debug log for the PC terminal: repeats of the same message are
--- suppressed for 2s so the console stays readable
-local lastDbgMsg, lastDbgT = "", 0
-local function dbg(msg)
-    local now = os.clock()
-    if msg == lastDbgMsg and now - lastDbgT < 2 then return end
-    lastDbgMsg, lastDbgT = msg, now
-    print("[dbg] " .. msg)
 end
 
 print(("Buffer storage: %d disk(s), %.1f MB free")
@@ -1277,6 +1287,9 @@ local function play(NAME)
     local paused = false
     local pausedAt = nil
     local abortPlay = false
+    -- forward declarations: playAudioChunk (below) must be able to call
+    -- these even though their bodies come later in play()
+    local handlePlayKey, handleTouch
 
     -- tell storage nodes how far playback has progressed so they free space
     local lastHeadTx = 0
@@ -1400,6 +1413,10 @@ local function play(NAME)
         local set = " /(\219\177\127@"
         for i = 1, #set do SHADE_CHARS[tostring(i - 1)] = set:sub(i, i) end
     end
+
+    -- half-block mode: one glyph covers two vertically stacked pixels
+    local HALF_GLYPH = string.char(143)
+    local halfRowText = nil
 
     local function render(frame, glyphs)
         if PIXEL then
@@ -1572,7 +1589,24 @@ local function play(NAME)
             end
         end
         while not sp.playAudio(tt, VOL) do
-            os.pullEvent("speaker_audio_empty")
+            -- speaker queue full: wait, but keep handling input so pauses
+            -- and touches are never swallowed
+            coordTick()
+            local tid = os.startTimer(0.05)
+            while true do
+                local ev, a, b, c = os.pullEvent()
+                if ev == "speaker_audio_empty" then
+                    break
+                elseif ev == "timer" and a == tid then
+                    break
+                elseif ev == "key" then
+                    handlePlayKey(a)
+                elseif ev == "monitor_touch" then
+                    handleTouch(b, c)
+                elseif ev == "rednet_message" then
+                    handleStoreMsg(a, b)
+                end
+            end
         end
     end
 
@@ -1677,7 +1711,7 @@ local function play(NAME)
         end
     end
 
-    local function handlePlayKey(p1)
+    function handlePlayKey(p1)
         if p1 == keys.space or p1 == keys.p then
             setPaused(not paused)
         elseif p1 == keys.q or p1 == keys.backspace then
@@ -1685,7 +1719,7 @@ local function play(NAME)
         end
     end
 
-    local function handleTouch(x, y)
+    function handleTouch(x, y)
         if not start then
             if inRect(cancelRect, x, y) then abortPlay = true end
             return
