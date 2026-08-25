@@ -1199,6 +1199,10 @@ local function play(NAME)
     end
 
     local function pump(target)
+        -- the bufferedAhead() cache is for UI only: download decisions need
+        -- EXACT numbers, or a stale low reading makes pump stampede new
+        -- requests past the target and fill the disk
+        bufAt = 0
         local k = 1
         while k <= #dls do
             local d = dls[k]
