@@ -50,10 +50,15 @@ local GFX = (mon.setGraphicsMode ~= nil)
 local sp = peripheral.find("speaker")
 
 local savedPal = {}
-for i = 0, 15 do savedPal[i + 1] = { mon.getPaletteColour(2 ^ i) } end
+for i = 0, 15 do
+    local ok, c1, c2, c3 = pcall(mon.getPaletteColour, 2 ^ i)
+    if ok then savedPal[i + 1] = { c1, c2, c3 } end
+end
 local function resetPalette()
     for i = 0, 15 do
-        mon.setPaletteColour(2 ^ i, unpack(savedPal[i + 1]))
+        if savedPal[i + 1] then
+            pcall(mon.setPaletteColour, 2 ^ i, unpack(savedPal[i + 1]))
+        end
     end
 end
 
@@ -77,7 +82,7 @@ local THEME = {
 }
 local function applyTheme()
     for _, t in ipairs(THEME) do
-        mon.setPaletteColour(t[1], t[2] / 255, t[3] / 255, t[4] / 255)
+        pcall(mon.setPaletteColour, t[1], t[2] / 255, t[3] / 255, t[4] / 255)
     end
 end
 resetPalette()
@@ -1074,13 +1079,13 @@ local function play(NAME)
             for gi = 0, 5 do
                 for bi = 0, 5 do
                     local idx = ri * 36 + gi * 6 + bi
-                    mon.setPaletteColour(idx, ri / 5, gi / 5, bi / 5)
+                    pcall(mon.setPaletteColour, idx, ri / 5, gi / 5, bi / 5)
                 end
             end
         end
         for i = 0, 39 do
             local v = i / 39
-            mon.setPaletteColour(216 + i, v, v, v)
+            pcall(mon.setPaletteColour, 216 + i, v, v, v)
         end
         rgbToIdx = {}
         for i = 0, 255 do
@@ -1394,7 +1399,7 @@ local function play(NAME)
         if dirty then
             for i = 1, 16 do
                 local c = palCur[i]
-                if c then mon.setPaletteColour(2 ^ (i - 1), c[1], c[2], c[3]) end
+                if c then pcall(mon.setPaletteColour, 2 ^ (i - 1), c[1], c[2], c[3]) end
             end
         end
     end
