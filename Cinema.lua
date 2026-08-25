@@ -50,6 +50,39 @@ local GFX = (mon.setGraphicsMode ~= nil)
 
 local sp = peripheral.find("speaker")
 
+-- Buffer storage: the computer's own root plus every mounted floppy/drive
+-- reachable on the network. Parts are striped across all of them round-robin.
+local DISKS = { "" }
+for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "drive" then
+        local drv = peripheral.wrap(name)
+        local ok, mp = pcall(function() return drv.getMountPath() end)
+        if ok and type(mp) == "string" and #mp > 0 and fs.isDir(mp) then
+            DISKS[#DISKS + 1] = mp
+        end
+    end
+end
+
+local function totalFree()
+    local t = 0
+    for _, d in ipairs(DISKS) do t = t + fs.getFreeSpace(d) end
+    return t
+end
+
+local function sweepBuffers()
+    -- remove buffered parts from every disk (startup hygiene / end of play)
+    for _, d in ipairs(DISKS) do
+        for _, f in ipairs(fs.list(d)) do
+            if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then
+                fs.delete(fs.combine(d, f))
+            end
+        end
+    end
+end
+
+print(("Buffer storage: %d disk(s), %.1f MB free")
+    :format(#DISKS, totalFree() / 1000000))
+
 local savedPal = {}
 for i = 0, 15 do
     local ok, c1, c2, c3 = pcall(mon.getPaletteColour, 2 ^ i)
@@ -1015,11 +1048,11 @@ local function settingsScreen()
 end
 
 local function play(NAME)
-    for _, f in ipairs(fs.list("")) do
-        if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then fs.delete(f) end
-    end
+    sweepBuffers()
 
-    local function pname(i) return NAME .. ".ccm." .. i end
+    -- stripe parts across every available disk, round-robin
+    local function diskOf(i) return DISKS[(i % #DISKS) + 1] end
+    local function pname(i) return diskOf(i) .. "/" .. NAME .. ".ccm." .. i end
     local enc = urlencode(NAME)
 
     print("Fetching " .. NAME .. "...")
@@ -1054,6 +1087,13 @@ local function play(NAME)
 
     mon.setTextScale(0.5)
     MW, MH = mon.getSize()
+
+    -- scale the buffer to all available storage (root + floppies), keeping a
+    -- small safety margin; PLAY_AHEAD stays one part below MAX_BUF so
+    -- downloads finish instead of being aborted at the ceiling
+    MAX_BUF = math.max(MAX_BUF, totalFree() - 3000000)
+    PLAY_AHEAD = math.max(PLAY_AHEAD, MAX_BUF - 2500000)
+    PREFILL = math.max(PART_LOW, math.floor(MAX_BUF * 0.6))
 
     if PIXEL then
         GFX_W, GFX_H = cw * 6, chh * 9
@@ -1293,7 +1333,7 @@ local function play(NAME)
         local est = lastPartSz > 0 and lastPartSz or 2500000
         if #dls < MAXDL and nextPart <= lastPart
              and bufferedAhead() + est <= MAX_BUF
-             and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace("") > 1500000
+             and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace(diskOf(nextPart)) > 1500000
              and os.clock() - lastDlFail > 0.5 then
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
             if not res2 then
@@ -1631,11 +1671,7 @@ local function play(NAME)
         if sp then pcall(sp.stop) end
         -- sweep any leftover parts/meta buffers: on a small disk they would
         -- otherwise starve the next playback's buffering
-        for _, f in ipairs(fs.list("")) do
-            if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then
-                fs.delete(f)
-            end
-        end
+        sweepBuffers()
     end
 
     local lastB, lastT = -1, os.clock()
@@ -1644,7 +1680,7 @@ local function play(NAME)
         local b = bufferedAhead()
         if b ~= lastB then lastB, lastT = b, os.clock() end
         uiStatusThrottled("buffering")
-        if fs.getFreeSpace("") < 3000000 then break end
+        if totalFree() < 3000000 then break end
         if (os.clock() - lastT > 5) and b >= PART_LOW then
             break
         end
