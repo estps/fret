@@ -1,10 +1,24 @@
 -- ComputerCraft door controller
 -- Connects to the python voice server through your cloudflare tunnel.
 -- Edit TUNNEL_URL to the https://...xxx.trycloudflare.com URL cloudflared prints.
+-- Set SIDES to the sides THIS computer controls (comma-separated).
+--
+-- Computer 1: SIDES = "back,top,left,right"
+-- Computer 2: SIDES = "bottom"
 
 local TUNNEL_URL = "wss://thread-spoke-ratings-phpbb.trycloudflare.com"
-local SIDE = "back"      -- redstone output side (top/bottom/left/right/front/back)
-local PULSE_TIME = 2.0   -- seconds door stays open
+local SIDES = "bottom"         -- comma-separated sides this computer controls
+local PULSE_TIME = 2.0
+
+local function parse_sides(s)
+    local t = {}
+    for side in s:gmatch("[^,]+") do
+        t[side:match("^%s*(.-)%s*$")] = true
+    end
+    return t
+end
+
+local my_sides = parse_sides(SIDES)
 
 local function connect()
     while true do
@@ -17,27 +31,25 @@ local function connect()
     end
 end
 
-print("door controller starting")
+print("door controller starting (sides: " .. SIDES .. ")")
 
 while true do
     local ws = connect()
     print("connected to server")
 
-    -- tell the server who we are
-    ws.send('{"hello":"door-computer"}')
+    ws.send('{"hello":"' .. SIDES .. '"}')
 
     while true do
-        local msg = ws.receive()  -- blocks until a message arrives
-        if not msg then break end -- connection dropped
+        local msg = ws.receive()
+        if not msg then break end
 
         local data = textutils.unserialiseJSON(msg)
-        if data and data.action == "pulse" then
-            local side = data.side or SIDE
-            print("pulsing " .. side .. "!")
-            redstone.setOutput(side, true)
+        if data and data.action == "pulse" and my_sides[data.side] then
+            print("pulsing " .. data.side .. "!")
+            redstone.setOutput(data.side, true)
             sleep(data.duration or PULSE_TIME)
-            redstone.setOutput(side, false)
-            ws.send('{"status":"done"}')
+            redstone.setOutput(data.side, false)
+            ws.send('{"status":"done","side":"' .. data.side .. '"}')
         end
     end
 
