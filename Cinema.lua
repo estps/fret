@@ -3,7 +3,7 @@
 local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 
 local PART_LOW = 4000000
-local PREFILL = 8000000
+local PREFILL = 5500000
 local MAX_BUF = 8000000
 local PLAY_AHEAD = 7500000
 local IDLE_SAVER = 75
@@ -1629,6 +1629,13 @@ local function play(NAME)
         closeDl()
         if hnd then pcall(function() hnd.close() end) hnd = nil end
         if sp then pcall(sp.stop) end
+        -- sweep any leftover parts/meta buffers: on a small disk they would
+        -- otherwise starve the next playback's buffering
+        for _, f in ipairs(fs.list("")) do
+            if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then
+                fs.delete(f)
+            end
+        end
     end
 
     local lastB, lastT = -1, os.clock()
