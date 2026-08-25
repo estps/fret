@@ -33,15 +33,21 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 
 local DISKS = { "" }
-for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == "drive" then
-        local drv = peripheral.wrap(name)
-        local ok, mp = pcall(function() return drv.getMountPath() end)
-        if ok and type(mp) == "string" and #mp > 0 and fs.isDir(mp) then
-            DISKS[#DISKS + 1] = mp
+
+local function scanDisks()
+    DISKS = { "" }
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "drive" then
+            local drv = peripheral.wrap(name)
+            local ok, mp = pcall(function() return drv.getMountPath() end)
+            if ok and type(mp) == "string" and #mp > 0 and fs.isDir(mp) then
+                DISKS[#DISKS + 1] = mp
+            end
         end
     end
 end
+
+scanDisks()
 
 local function totalFree()
     local t = 0
@@ -49,8 +55,25 @@ local function totalFree()
     return t
 end
 
-dbg(("storage: %d disk(s), %.1f MB free - waiting for display.lua")
-    :format(#DISKS, totalFree() / 1e6))
+local function logStorage()
+    dbg(("storage: %d disk(s), %.1f MB free total")
+        :format(#DISKS, totalFree() / 1e6))
+    for _, d in ipairs(DISKS) do
+        dbg(("  '%s': %.2f MB free")
+            :format(d == "" and "<root>" or d, fs.getFreeSpace(d) / 1e6))
+    end
+end
+
+logStorage()
+
+local lastInvLog = 0
+local function logInventoryIfStuck()
+    local now = os.clock()
+    if now - lastInvLog > 15 then
+        lastInvLog = now
+        logStorage()
+    end
+end
 
 local netHead = 0
 
@@ -145,11 +168,11 @@ local function bufferMovie(NAME)
     dbg(("buffering '%s': %dx%d @%dfps, %d parts (~%.0f MB)")
         :format(NAME, w, h, fps, partCount, partCount * 0.95))
 
-    local MAX_BUF = math.max(4000000, totalFree() - RESERVE)
     local dls = {}
     local lastDlFail = 0
     local lastPartSz = 0
     local lastGc = 0
+    local lastWhyLog = 0
 
     local function rname(i) return NAME .. ".ccm." .. i end
 
@@ -223,6 +246,7 @@ local function bufferMovie(NAME)
         local nowC = os.clock()
         if nowC - lastGc > 3 then
             lastGc = nowC
+            scanDisks()          -- floppies may have been (re)mounted
             local head = math.max(netHead, readHeadFile())
             local removed = 0
             for _, dsk in ipairs(DISKS) do
@@ -249,6 +273,9 @@ local function bufferMovie(NAME)
             nextPart = math.min(nextPart, d.idx)
         end
 
+        -- live cap: total free storage right now minus the reserve
+        local MAX_BUF = math.max(4000000, totalFree() - RESERVE)
+
         local est = lastPartSz > 0 and lastPartSz or 1000000
         local b = bufferedAhead()
         if #dls < MAXDL and nextPart <= lastPart then
@@ -256,6 +283,10 @@ local function bufferMovie(NAME)
             if b + est > MAX_BUF then
                 why = ("headroom wait: buf %.2f + est %.2f > cap %.2f MB")
                     :format(b / 1e6, est / 1e6, MAX_BUF / 1e6)
+                if os.clock() - lastWhyLog > 15 then
+                    lastWhyLog = os.clock()
+                    logInventoryIfStuck()
+                end
             else
                 local tgt, anyBest, anyFree = pickDisk(est)
                 if not tgt then
