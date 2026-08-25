@@ -188,6 +188,23 @@ local GLYPH = {
     S = { " ####", "#    ", " ### ", "    #", "#### " },
     E = { "#####", "#    ", "###  ", "#    ", "#####" },
     D = { "#### ", "#   #", "#   #", "#   #", "#### " },
+    B = { "#### ", "#   #", "#### ", "#   #", "#### " },
+    F = { "#####", "#    ", "#### ", "#    ", "#    " },
+    G = { " ### ", "#    ", "#  ##", "#   #", " ### " },
+    H = { "#   #", "#   #", "#####", "#   #", "#   #" },
+    I = { "#####", "  #  ", "  #  ", "  #  ", "#####" },
+    J = { "    #", "    #", "    #", "#   #", " ### " },
+    K = { "#   #", "#  # ", "###  ", "#  # ", "#   #" },
+    L = { "#    ", "#    ", "#    ", "#    ", "#####" },
+    M = { "#   #", "## ##", "# # #", "#   #", "#   #" },
+    N = { "#   #", "##  #", "# # #", "#  ##", "#   #" },
+    O = { " ### ", "#   #", "#   #", "#   #", " ### " },
+    Q = { " ### ", "#   #", "# # #", "#  # ", " ## #" },
+    R = { "#### ", "#   #", "#### ", "#  # ", "#   #" },
+    W = { "#   #", "#   #", "# # #", "## ##", "#   #" },
+    X = { "#   #", " # # ", "  #  ", " # # ", "#   #" },
+    Y = { "#   #", "#   #", " ### ", "  #  ", "  #  " },
+    Z = { "#####", "   # ", "  #  ", " #   ", "#####" },
 }
 
 local function drawGlyph(ch, x, y, c)
@@ -374,66 +391,47 @@ local function homeMenu(movies, online)
         local vw = math.min(CARD_W, MW - x + 1)
         if vw < 6 then return end
         local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
-        local body = pressed and colours.lightGrey or (selected and colours.blue or colours.grey)
-        mon.setBackgroundColour(selected and colours.yellow or colours.lightGrey)
-        mon.setCursorPos(math.max(1, x + 1), y)
-        mon.write(string.rep(" ", math.min(CARD_W - 2, MW - x - 1)))
-        mon.setCursorPos(math.max(1, x + 1), y + CARD_H - 1)
-        mon.write(string.rep(" ", math.min(CARD_W - 2, MW - x - 1)))
-        local bwid = math.min(CARD_W - 2, MW - (x + 1) + 1)
-        mon.setBackgroundColour(body)
-        for r = 1, CARD_H - 2 do
-            mon.setCursorPos(x + 1, y + r)
-            mon.write(string.rep(" ", bwid))
-        end
-        mon.setBackgroundColour(acc)
-        for r = 2, CARD_H - 3 do
-            mon.setCursorPos(x + 1, y + r)
-            mon.write("  ")
-        end
-        mon.setBackgroundColour(selected and colours.blue or colours.grey)
-        for r = 3, CARD_H - 3, 2 do
-            mon.setCursorPos(x + 1, y + r)
+        -- border ring: bright for the focused card, quiet otherwise
+        local ring = pressed and colours.white or (selected and colours.white or colours.grey)
+        mon.setBackgroundColour(ring)
+        for c = 0, CARD_W - 3 do
+            mon.setCursorPos(x + 1 + c, y)
+            mon.write(" ")
+            mon.setCursorPos(x + 1 + c, y + CARD_H - 1)
             mon.write(" ")
         end
-        if selected and x + CARD_W - 2 <= MW then
-            mon.setBackgroundColour(colours.yellow)
-            for r = 2, CARD_H - 2 do
-                mon.setCursorPos(x + CARD_W - 2, y + r)
-                mon.write(" ")
+        for r = 1, CARD_H - 2 do
+            mon.setCursorPos(x + 1, y + r)
+            mon.write(" ")
+            mon.setCursorPos(x + CARD_W - 2, y + r)
+            mon.write(" ")
+        end
+        -- poster body
+        mon.setBackgroundColour(acc)
+        for r = 2, CARD_H - 3 do
+            mon.setCursorPos(x + 2, y + r)
+            mon.write(string.rep(" ", math.min(CARD_W - 4, MW - x - 3)))
+        end
+        -- giant initial centred in the poster zone (glyphs are 5 rows tall,
+        -- the interior is exactly CARD_H-4 rows: made to measure)
+        local ch = it.label:sub(1, 1):upper()
+        if GLYPH[ch] then
+            local gx = x + 2 + math.floor((CARD_W - 4 - 5) / 2)
+            if gx + 5 <= MW + 1 then
+                drawGlyph(ch, gx, y + 2,
+                    selected and colours.black or colours.grey)
             end
         end
-        local maxT = math.min(CARD_W - 5, MW - (x + 4) + 1)
-        local tCol = pressed and colours.black
-            or (selected and colours.white or colours.lightBlue)
-        local sCol = pressed and colours.black
-            or (selected and colours.lightBlue or colours.lightGrey)
+        -- title strip along the bottom of the card
+        local maxT = math.min(CARD_W - 4, MW - (x + 2) + 1)
         if maxT > 0 then
-            local title = it.label
-            if selected and #title > CARD_W - 5 then
-                local cyc = title .. "   "
-                local pos = (math.floor(tick / 4) % (#title + 3)) + 1
-                local ext = cyc .. cyc
-                title = ext:sub(pos, pos + maxT - 1)
-            else
-                title = title:sub(1, maxT)
-            end
-            mon.setTextColour(tCol)
-            mon.setCursorPos(x + 4, y + 2)
-            mon.write(title)
-            local sub = it.sub or fmtDur(it.dur)
-            mon.setTextColour(sCol)
-            mon.setCursorPos(x + 4, y + 3)
-            mon.write(sub and sub:sub(1, maxT) or "")
+            mon.setBackgroundColour(pressed and colours.white or colours.black)
+            mon.setTextColour(selected and colours.yellow or colours.lightGrey)
+            mon.setCursorPos(x + 2, y + CARD_H - 2)
+            mon.write(it.label:sub(1, maxT))
         end
-        local tag = it.kind == "settings" and "SYSTEM"
-            or (it.isNew and "NEW!" or "MOVIE")
-        local tagX = x + CARD_W - 2 - #tag
-        if tagX + #tag <= MW + 1 then
-            mon.setTextColour(it.isNew and it.kind ~= "settings" and colours.yellow
-                or colours.lightGrey)
-            mon.setCursorPos(tagX, y + CARD_H - 3)
-            mon.write(tag)
+        if it.isNew and it.kind ~= "settings" then
+            chip(math.min(x + CARD_W - 5, MW - 3), y, "NEW", colours.yellow, colours.black)
         end
         mon.setBackgroundColour(colours.black)
     end
@@ -483,12 +481,57 @@ local function homeMenu(movies, online)
         end
     end
 
+    local function metaW() return MW >= 44 and 13 or 0 end
+
+    local function drawHero()
+        -- rows 2-6: selected title in big glyphs + meta column on the right
+        local it = items[sel]
+        mon.setBackgroundColour(colours.black)
+        for r = 2, 6 do
+            mon.setCursorPos(1, r)
+            mon.write(string.rep(" ", MW))
+        end
+        if not it then return end
+        local metaW = MW >= 44 and 13 or 0
+        local metaX = MW - metaW + 1
+        local maxW = math.max(8, (metaW > 0 and metaX - 4 or MW - 3))
+        local label = it.label:upper()
+        local line1 = ""
+        for w in label:gmatch("%S+") do
+            local cand = line1 == "" and w or (line1 .. " " .. w)
+            if wordWidth(cand) <= maxW then line1 = cand end
+        end
+        if #line1 > 0 and wordWidth(line1) <= maxW then
+            drawWord(line1, 2, 2, colours.white)
+        elseif #label > 0 then
+            mon.setTextColour(colours.white)
+            mon.setCursorPos(2, 4)
+            mon.write(label:sub(1, math.min(#label, maxW)))
+        end
+        if metaW > 0 then
+            chip(metaX, 2, string.rep(" ", metaW - 1), colours.grey, colours.black)
+            mon.setTextColour(colours.black)
+            mon.setCursorPos(metaX + 1, 2)
+            mon.write(fmtDur(it.dur) or it.sub or "VIDEO")
+            if it.isNew and it.kind == "movie" then
+                chip(metaX, 3, " NEW ", colours.yellow, colours.black)
+            else
+                chip(metaX, 3, string.rep(" ", metaW - 1), colours.black, colours.black)
+            end
+            mon.setTextColour(colours.lightGrey)
+            mon.setBackgroundColour(colours.black)
+            mon.setCursorPos(metaX, 4)
+            mon.write((("%d/%d"):format(sel, n)):sub(1, metaW - 1))
+            chip(metaX, 5, " PLAY \7 ", colours.lime, colours.black)
+        end
+    end
+
     local function drawInfoLine()
         mon.setBackgroundColour(colours.black)
         mon.setCursorPos(2, HEADER_ROWS)
         mon.write(string.rep(" ", MW - 2))
         local it = items[sel]
-        if it and it.kind == "movie" then
+        if it and it.kind == "movie" and metaW() == 0 then
             mon.setTextColour(colours.lightGrey)
             mon.setCursorPos(2, HEADER_ROWS)
             mon.write(("%d/%d"):format(sel, n))
@@ -504,37 +547,40 @@ local function homeMenu(movies, online)
     local function drawChrome()
         mon.setBackgroundColour(colours.black)
         mon.clear()
-        drawLogo(2, 1)
+        -- slim marquee strip across the very top
+        mon.setBackgroundColour(colours.red)
+        mon.setCursorPos(1, 1)
+        mon.write(string.rep(" ", MW))
+        mon.setBackgroundColour(colours.black)
         local cs = clockStr()
-        segments(5, MW - 17, {
-            { t = online and " ONLINE " or " OFFLINE", c = colours.black },
-        }, online and colours.green or colours.red)
         if cs ~= "" then
-            mon.setTextColour(colours.lightBlue)
-            mon.setBackgroundColour(colours.black)
-            mon.setCursorPos(math.max(1, MW - #cs + 1), 5)
+            mon.setTextColour(colours.white)
+            mon.setCursorPos(math.max(1, MW - #cs + 1), 7)
             mon.write(cs)
         end
-        mon.setTextColour(colours.lightGrey)
-        mon.setCursorPos(2, 6)
-        mon.write(string.rep("\127", MW - 2))
-        mon.setTextColour(colours.white)
-        mon.setCursorPos(2, 7)
-        mon.write("YOUR MOVIES")
-        mon.setTextColour(colours.lightGrey)
+        segments(7, MW - 17, {
+            { t = online and " ONLINE " or " OFFLINE", c = colours.black },
+        }, online and colours.green or colours.red)
+        drawHero()
+        -- divider (left segment only; status chip + clock own the right)
+        mon.setBackgroundColour(colours.grey)
+        mon.setCursorPos(1, 7)
+        mon.write(string.rep(" ", math.max(0, MW - 18)))
+        mon.setBackgroundColour(colours.black)
         drawInfoLine()
         segments(MH, 1, {
-            { t = " <>", c = colours.lime },
-            { t = " browse", c = colours.lightBlue },
-            { t = "   Enter", c = colours.lime },
-            { t = " open", c = colours.lightBlue },
-            { t = "   tap", c = colours.cyan },
-            { t = " card", c = colours.lightBlue },
-            { t = "   H", c = colours.lime },
-            { t = " help", c = colours.lightBlue },
-        }, colours.grey)
-        mon.setTextColour(colours.lightGrey)
+            { t = " <>", c = colours.red },
+            { t = " browse", c = colours.white },
+            { t = "   Enter", c = colours.red },
+            { t = " play", c = colours.white },
+            { t = "   tap", c = colours.orange },
+            { t = " card", c = colours.white },
+            { t = "   H", c = colours.red },
+            { t = " help", c = colours.white },
+        }, colours.black)
+        mon.setBackgroundColour(colours.grey)
         mon.setCursorPos(math.max(1, MW - 9), MH)
+        mon.setTextColour(colours.black)
         mon.write(tostring(n) .. " items ")
     end
 
@@ -614,7 +660,7 @@ local function homeMenu(movies, online)
                 if cs ~= "" and cpos then
                     mon.setBackgroundColour(colours.black)
                     mon.setTextColour(tick % 10 < 5 and colours.lightBlue or colours.grey)
-                    mon.setCursorPos(math.max(1, MW - #cs + 1) + cpos - 1, 5)
+                    mon.setCursorPos(math.max(1, MW - #cs + 1) + cpos - 1, 7)
                     mon.write(tick % 10 < 5 and ":" or " ")
                 end
             end
@@ -668,9 +714,12 @@ local function homeMenu(movies, online)
                         local x = 2 + (c - c0) * (CARD_W + GAPX)
                         local y = cardsY + r * (CARD_H + GAPY) + CARD_H - 1
                         if x + CARD_W <= MW + 1 then
-                            mon.setBackgroundColour(tick % 12 < 6 and colours.yellow
+                            -- pulse the focused card's ring, not a fat bar
+                            mon.setBackgroundColour(tick % 12 < 6 and colours.red
                                 or colours.white)
                             mon.setCursorPos(x + 1, y)
+                            mon.write(string.rep(" ", CARD_W - 2))
+                            mon.setCursorPos(x + 1, y - CARD_H + 1)
                             mon.write(string.rep(" ", CARD_W - 2))
                             mon.setBackgroundColour(colours.black)
                         end
@@ -705,6 +754,7 @@ local function homeMenu(movies, online)
                     ensureVisible()
                     drawGrid()
                 end
+                drawHero()
                 drawInfoLine()
             end
             if a == keys.enter or a == keys.space then
@@ -759,6 +809,7 @@ local function homeMenu(movies, online)
                         onlineNow = true
                         drawStatusChip()
                         drawGrid()
+                        drawHero()
                         drawInfoLine()
                     else
                         onlineNow = false
@@ -979,6 +1030,9 @@ local function play(NAME)
     if not w then error("Corrupt meta file", 0) end
     local nb = tonumber(blk) or 1
     local MODE = tonumber(md) or 0
+    if MODE > 2 then
+        error("movie needs render mode " .. MODE .. ", this player supports 0-2", 0)
+    end
     local HALF = MODE == 1
     local cw, chh = w * nb, h * nb
     local lastPart = partCount - 1
@@ -996,11 +1050,17 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local MAXDL = 2
+    local MAXDL = 4
     local nextPart = 0
     local dls = {}
+    local lastDlFail = 0
 
+    local bufCache, bufAt = 0, 0
     local function bufferedAhead()
+        -- walking every part with fs.getSize is expensive on long movies,
+        -- so serve a quarter-second-stale cached value instead
+        local now = os.clock()
+        if now - bufAt < 0.25 then return bufCache end
         local total = 0
         for i = 0, nextPart - 1 do
             local f = pname(i)
@@ -1011,6 +1071,7 @@ local function play(NAME)
                 if fs.exists(f) then total = total + fs.getSize(f) end
             end
         end
+        bufCache, bufAt = total, now
         return total
     end
 
@@ -1141,7 +1202,7 @@ local function play(NAME)
         local k = 1
         while k <= #dls do
             local d = dls[k]
-            local piece = d.res.read(16384)
+            local piece = d.res.read(65536)
             if piece then
                 d.fh.write(piece)
                 k = k + 1
@@ -1154,13 +1215,15 @@ local function play(NAME)
                 table.remove(dls, k)
             end
         end
-        while #dls < MAXDL and nextPart <= lastPart
-             and bufferedAhead() < target and fs.getFreeSpace("") > 1500000 do
+        -- failed requests retry at most twice a second: sleeping here would
+        -- freeze the render loop and drop frames
+        if #dls < MAXDL and nextPart <= lastPart
+             and bufferedAhead() < target and fs.getFreeSpace("") > 1500000
+             and os.clock() - lastDlFail > 0.5 then
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(pname(nextPart)), nil, true)
             if not res2 then
-                print("part dl failed: " .. tostring(err2) .. ", retrying")
-                sleep(2)
-                break
+                lastDlFail = os.clock()
+                return
             end
             local tmp = pname(nextPart) .. ".part"
             local fh = fs.open(tmp, "wb")
@@ -1337,7 +1400,7 @@ local function play(NAME)
             mon.clearLine()
             mon.setCursorPos(1, MH)
             mon.write(string.rep(" ", MW))
-            chip(1, MH, " II PAUSED ", colours.yellow, colours.black)
+            chip(1, MH, " II PAUSED ", colours.red, colours.white)
             mon.setBackgroundColour(colours.grey)
             mon.setTextColour(colours.lightBlue)
             mon.setCursorPos(13, MH)
@@ -1365,7 +1428,7 @@ local function play(NAME)
                     mon.setCursorPos(bx, by + r)
                     mon.write(string.rep(" ", bw))
                 end
-                drawWord("PAUSED", bx + 4, by + 1, colours.yellow)
+                drawWord("PAUSED", bx + 4, by + 1, colours.red)
                 centre(by + 6, "tap anywhere to resume", colours.lightBlue)
                 if bw >= ww + 12 then
                     eqRect = { x = bx + bw - 7, y = by + 1 }
@@ -1380,7 +1443,7 @@ local function play(NAME)
             mon.write(string.rep(" ", MW))
             local pf = math.floor(MW * frac + 0.5)
             if pf > 0 then
-                mon.setBackgroundColour(colours.lime)
+                mon.setBackgroundColour(colours.red)
                 mon.setCursorPos(1, MH - 1)
                 mon.write(string.rep(" ", pf))
             end
