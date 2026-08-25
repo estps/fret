@@ -163,9 +163,6 @@ local function sweepBuffers()
     end
 end
 
-print(("Buffer storage: %d disk(s), %.1f MB free")
-    :format(#DISKS, totalFree() / 1000000))
-
 -- throttled debug log for the PC terminal: repeats of the same message are
 -- suppressed for 2s so the console stays readable
 local lastDbgMsg, lastDbgT = "", 0
@@ -174,6 +171,14 @@ local function dbg(msg)
     if msg == lastDbgMsg and now - lastDbgT < 2 then return end
     lastDbgMsg, lastDbgT = msg, now
     print("[dbg] " .. msg)
+end
+
+print(("Buffer storage: %d disk(s), %.1f MB free")
+    :format(#DISKS, totalFree() / 1000000))
+if #DISKS == 1 then
+    print("WARNING: no drives visible - parts downloaded by storage.lua")
+    print("computers can only be read if this computer is on the SAME")
+    print("wired modem network as their drives.")
 end
 
 local savedPal = {}
