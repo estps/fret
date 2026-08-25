@@ -97,6 +97,7 @@ local function partExists(movie, i)
 end
 
 local function pickDisk(est)
+    scanDisks()                  -- catch newly mounted network drives
     local best, bestFree, anyBest, anyFree = nil, -1, nil, -1
     for _, d in ipairs(DISKS) do
         local f = fs.getFreeSpace(d)
@@ -171,13 +172,19 @@ local function drainActive()
     local k = 1
     while k <= #active do
         local a = active[k]
-        local piece = a.res.read(65536)
-        if piece then
-            local okW = pcall(a.fh.write, piece)
-            if okW then
-                k = k + 1
-            else
-                print("[node" .. MYID .. "] WRITE FAIL part " .. a.part)
+        -- pull several chunks per pass: reading one 64KB chunk per main-loop
+        -- iteration throttles a 1MB part to ~5s and makes display re-assign
+        local done = false
+        for _ = 1, 8 do
+            local piece = a.res.read(65536)
+            if not piece then
+                done = true
+                break
+            end
+            local okW, werr = pcall(a.fh.write, piece)
+            if not okW then
+                print("[node" .. MYID .. "] WRITE FAIL part " .. a.part
+                    .. ": " .. tostring(werr))
                 pcall(function() a.fh.close() end)
                 pcall(function() a.res.close() end)
                 pcall(fs.delete, fs.combine(a.disk,
@@ -185,8 +192,13 @@ local function drainActive()
                 pcall(rednet.send, a.replyTo,
                     { cmd = "fail", movie = a.movie, part = a.part }, PROTO)
                 table.remove(active, k)
+                done = nil               -- job removed; advance to next
+                break
             end
-        else
+        end
+        if done == nil then
+            -- handled above (write failure): move on to the next download
+        elseif done then
             a.fh.close()
             a.res.close()
             -- move whichever temp file appeared to its final name
@@ -206,12 +218,14 @@ local function drainActive()
             pcall(rednet.send, a.replyTo,
                 { cmd = "done", movie = a.movie, part = a.part }, PROTO)
             table.remove(active, k)
+        else
+            k = k + 1                     -- still streaming; next job
         end
     end
 end
 
 while true do
-    local id, msg = rednet.receive(PROTO, 0.2)
+    local id, msg = rednet.receive(PROTO, 0.05)
 
     if type(msg) == "table" then
         if msg.cmd == "assign" and type(msg.movie) == "string" and tonumber(msg.part) then
