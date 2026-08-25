@@ -1103,7 +1103,7 @@ local function play(NAME)
         return string.char(87 + v)
     end
 
-    local MAXDL = 4
+    local MAXDL = 3
     local nextPart = 0
     local dls = {}
     local lastDlFail = 0
@@ -1290,7 +1290,7 @@ local function play(NAME)
         -- headroom check: never START a download unless the finished part
         -- will still fit under MAX_BUF - aborted partials are pure waste,
         -- so it's far better to wait than to start one that gets killed
-        local est = lastPartSz > 0 and lastPartSz or 5000000
+        local est = lastPartSz > 0 and lastPartSz or 2500000
         if #dls < MAXDL and nextPart <= lastPart
              and bufferedAhead() + est <= MAX_BUF
              and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace("") > 1500000
