@@ -1061,20 +1061,21 @@ local function play(NAME)
     sweepBuffers()
 
     -- stripe parts across every available disk: each new part lands on
-    -- whichever disk currently has the most free space
+    -- whichever disk has the most free space AND room for the whole part
     local partDisk = {}
-    local function diskFor(i)
-        if partDisk[i] then return partDisk[i] end
-        local best, bestFree = DISKS[1], -1
+    local function pickDisk(est)
+        local best, bestFree, anyBest, anyFree = nil, -1, nil, -1
         for _, d in ipairs(DISKS) do
             local f = fs.getFreeSpace(d)
-            if f > bestFree then best, bestFree = d, f end
+            if f > anyFree then anyBest, anyFree = d, f end
+            if f >= est + 150000 and f > bestFree then best, bestFree = d, f end
         end
-        partDisk[i] = best
-        return best
+        return best, anyBest, anyFree
     end
     local function rname(i) return NAME .. ".ccm." .. i end
-    local function pname(i) return diskFor(i) .. "/" .. rname(i) end
+    local function pname(i)
+        return (partDisk[i] or DISKS[1]) .. "/" .. rname(i)
+    end
     local enc = urlencode(NAME)
 
     print("Fetching " .. NAME .. "...")
@@ -1324,8 +1325,21 @@ local function play(NAME)
             local d = dls[k]
             local piece = d.res.read(65536)
             if piece then
-                d.fh.write(piece)
-                k = k + 1
+                local okW, werr = pcall(d.fh.write, piece)
+                if okW then
+                    k = k + 1
+                else
+                    -- target disk filled mid-download: abandon this part
+                    -- cleanly and retry it on another disk later
+                    print("[dbg] WRITE FAIL part " .. d.idx .. ": " .. tostring(werr))
+                    pcall(function() d.fh.close() end)
+                    pcall(function() d.res.close() end)
+                    pcall(fs.delete, d.tmp)
+                    partDisk[d.idx] = nil
+                    nextPart = d.idx
+                    lastDlFail = os.clock()
+                    table.remove(dls, k)
+                end
             else
                 d.fh.close()
                 d.res.close()
@@ -1335,7 +1349,7 @@ local function play(NAME)
                     if okSz and type(sz) == "number" then
                         lastPartSz = sz
                         dbg(("part %d complete (%.2f MB on %s)")
-                            :format(d.idx, sz / 1000000, diskFor(d.idx)))
+                            :format(d.idx, sz / 1000000, pname(d.idx)))
                     end
                 end
                 table.remove(dls, k)
@@ -1366,11 +1380,11 @@ local function play(NAME)
             elseif b >= math.min(target, MAX_BUF) then
                 why = ("target reached: buf %.2f MB"):format(b / 1e6)
             else
-                local tgt = diskFor(nextPart)
-                local freeTgt = fs.getFreeSpace(tgt)
-                if freeTgt <= est + 200000 then
-                    why = ("no disk room: best '%s' has %.2f MB free, part needs %.2f MB")
-                        :format(tgt == "" and "<root>" or tgt, freeTgt / 1e6, (est + 200000) / 1e6)
+                local tgt, anyBest, anyFree = pickDisk(est)
+                if not tgt then
+                    why = ("no disk room: need %.2f MB, fullest '%s' has %.2f MB")
+                        :format((est + 150000) / 1e6,
+                            anyBest == "" and "<root>" or anyBest, anyFree / 1e6)
                 elseif os.clock() - lastDlFail <= 0.5 then
                     why = "retry cooldown"
                 end
@@ -1380,9 +1394,11 @@ local function play(NAME)
         if #dls < MAXDL and nextPart <= lastPart
              and b + est <= MAX_BUF
              and b < math.min(target, MAX_BUF)
-             and fs.getFreeSpace(diskFor(nextPart)) > est + 200000
              and os.clock() - lastDlFail > 0.5 then
-            dbg(("GET %s -> %s"):format(rname(nextPart), diskFor(nextPart)))
+            local tgt = pickDisk(est)
+            if not tgt then return end
+            partDisk[nextPart] = tgt
+            dbg(("GET %s -> %s"):format(rname(nextPart), tgt))
             local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(rname(nextPart)), nil, true)
             if not res2 then
                 lastDlFail = os.clock()
