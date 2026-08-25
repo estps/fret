@@ -1,3 +1,5 @@
+
+
 local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
 
 local PART_LOW = 4000000
@@ -1271,6 +1273,16 @@ local function play(NAME)
         end
         -- failed requests retry at most twice a second: sleeping here would
         -- freeze the render loop and drop frames
+        -- hard ceiling: abort newest in-flight downloads while over MAX_BUF
+        -- (finished parts + .part files both count toward bufferedAhead())
+        bufAt = 0
+        while #dls > 0 and bufferedAhead() >= MAX_BUF do
+            local d = table.remove(dls)
+            pcall(function() d.res.close() end)
+            pcall(function() d.fh.close() end)
+            pcall(fs.delete, d.tmp)
+            nextPart = d.idx          -- re-request this part once below the cap
+        end
         if #dls < MAXDL and nextPart <= lastPart
              and bufferedAhead() < math.min(target, MAX_BUF) and fs.getFreeSpace("") > 1500000
              and os.clock() - lastDlFail > 0.5 then
