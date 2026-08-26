@@ -1,13 +1,33 @@
+------------------------------------------------------------------------------
+-- CC CINEMA - cloud video player for CC:Tweaked + CC:Graphics
+--
+-- Plays movies produced by prepare.py (render mode 3 = GFX pixel stream).
+--
+-- SERVER SETUP (on your PC, inside the movie folder):
+--   python3 -m http.server 8080
+--   cloudflared tunnel --url http://localhost:8080
+--   copy the https://xxxx.trycloudflare.com URL it prints
+--
+-- IN GAME:
+--   cinema        first run asks for the tunnel URL (saved to /cinema.cfg)
+--
+-- CONTROLS:
+--   menu : UP/DOWN select | ENTER play | U url | R refresh | ESC quit
+--   play : SPACE pause | LEFT/RIGHT +-10s | UP/DOWN volume | M mute | Q quit
+--   touch: left third -10s | middle pause | right third +10s
+--          progress bar scrubs | bottom-right corner stops
+------------------------------------------------------------------------------
 
 local CFG_PATH = "/cinema.cfg"
 
-local CHUNK           = 65000
-local AUDIO_REC_SEC   = 0.25
-local VIDEO_CAP       = 1400000
-local AUDIO_CAP       = 720000
-local SPK_PENDING_MAX = 64000
+local CHUNK           = 65000     -- must match prepare.py
+local AUDIO_REC_SEC   = 0.25      -- one type-4 record = 0.25 s
+local VIDEO_CAP       = 1400000   -- ram budget: buffered video frames
+local AUDIO_CAP       = 720000    -- ram budget: buffered audio (~2 min)
+local SPK_PENDING_MAX = 64000     -- bytes queued in the speaker at once
 local READ_BLOCK      = 32768
 
+-- ui palette slots (video uses 0..215, the 6x6x6 cube)
 local BG      = 240
 local PANEL   = 241
 local PANEL2  = 242
@@ -20,8 +40,13 @@ local RED     = 248
 local DEEP    = 250
 local BLACK   = 0
 
-local CFG = { BASE_URL = "", VOLUME = 1.0, TEXT_SCALE = 0.5, AUTO_ZOOM = true }
+local HUD_H = 30
 
+local CFG = { BASE_URL = "", VOLUME = 1.0, TEXT_SCALE = 0.5, AUTO_ZOOM = true, AUDIO_OFFSET = 0, AUDIO_LAG_MS = 300 }
+
+--------------------------------------------------------------------------
+-- tiny helpers
+--------------------------------------------------------------------------
 
 local sleep = os.sleep
 
@@ -46,6 +71,9 @@ local function fmtTime(sec)
     return string.format("%d:%02d", m, s)
 end
 
+--------------------------------------------------------------------------
+-- config
+--------------------------------------------------------------------------
 
 local function loadCfg()
     if fs.exists(CFG_PATH) then
@@ -90,6 +118,9 @@ local function promptUrl()
     return true
 end
 
+--------------------------------------------------------------------------
+-- http
+--------------------------------------------------------------------------
 
 local function httpGetText(url)
     local r = http.get(url, nil, true)
@@ -100,6 +131,8 @@ local function httpGetText(url)
     return s
 end
 
+-- some CC:Graphics builds reject string pixel rows and only accept tables of
+-- numbers. probe once, then route every row blit through these helpers.
 local ROW_STRINGS = true
 
 local function probePixelFormat()
@@ -117,6 +150,7 @@ local function drawRow(x, y, s)
     if ROW_STRINGS then
         term.drawPixels(x, y, s)
     else
+        -- this build wants a list of rows; each row is a list of palette ids
         term.drawPixels(x, y, { { s:byte(1, #s) } })
     end
 end
@@ -131,6 +165,9 @@ local function drawRows(x, y, rows)
     end
 end
 
+--------------------------------------------------------------------------
+-- 3x5 pixel font
+--------------------------------------------------------------------------
 
 local FONT_SRC = {
     ["0"]="###|#.#|#.#|#.#|###", ["1"]=".#.|##.|.#.|.#.|###",
@@ -184,6 +221,7 @@ local function fitText(s, maxPx, scale)
     return s:sub(1, n) .. "~"
 end
 
+-- draws text with a solid baked background (fast path)
 local function drawText(x, y, s, fg, bg, scale)
     scale = scale or 1
     for r = 0, 4 do
@@ -204,6 +242,9 @@ local function drawText(x, y, s, fg, bg, scale)
     return textWidth(s, scale)
 end
 
+--------------------------------------------------------------------------
+-- screen helpers
+--------------------------------------------------------------------------
 
 local SW, SH = 0, 0
 
@@ -250,6 +291,9 @@ local function drawSpinner(cx, cy, label)
     end
 end
 
+--------------------------------------------------------------------------
+-- frame scaling
+--------------------------------------------------------------------------
 
 local REPMAP = {}
 
@@ -303,10 +347,16 @@ local function makeFrame(S, data)
     return rows
 end
 
+--------------------------------------------------------------------------
+-- shared player state + streaming downloader
+--------------------------------------------------------------------------
 
-local function newState(base, name, parts, fps, dur, metaW, metaH)
+local function newState(base, name, parts, fps, dur, metaW, metaH,
+                        sepAudio, pcmAudio)
     return {
         base = base, name = name, parts = parts, fps = fps, dur = dur,
+        sepAudio = sepAudio and true or false,
+        pcmAudio = pcmAudio and true or false,
         metaW = metaW, metaH = metaH,
         videoQ = {}, videoBytes = 0, audioQ = {}, audioBytes = 0,
         partStartFrame = {}, partStartAudio = {},
@@ -366,13 +416,17 @@ local function initDims(S, size)
     end
     S.vw = bestW
     S.vh = size / bestW
-    local f = math.min(SW / S.vw, SH / S.vh)
+    -- maximise screen usage: integer nearest-neighbour zoom with centre
+    -- crop when upscaling, fractional step-down when source is bigger.
+    -- video never renders under the HUD bar, so scale to the area above it
+    local vh2 = SH - HUD_H
+    local f = math.min(SW / S.vw, vh2 / S.vh)
     local geo
     if f < 0.75 then
         local ds = math.max(math.ceil(1 / f), 1)
         local dw, dh = round(S.vw / ds), round(S.vh / ds)
         geo = { kind = "down", ds = ds,
-                vx = math.floor((SW - dw) / 2), vy = math.floor((SH - dh) / 2),
+                vx = math.floor((SW - dw) / 2), vy = math.floor((vh2 - dh) / 2),
                 w = dw, h = dh, z = 1 }
     else
         local z = 1
@@ -380,14 +434,14 @@ local function initDims(S, size)
         local dw, dh = S.vw * z, S.vh * z
         local x0 = math.floor((dw - SW) / 2)
         if x0 < 0 then x0 = 0 end
-        local y0 = math.floor((dh - SH) / 2)
+        local y0 = math.floor((dh - vh2) / 2)
         if y0 < 0 then y0 = 0 end
         local wv = math.min(dw - x0, SW)
-        local hv = math.min(dh - y0, SH)
+        local hv = math.min(dh - y0, vh2)
         geo = { kind = "zoom", z = z,
                 x0 = x0, y0 = y0, w = wv, h = hv,
                 vx = math.floor((SW - wv) / 2),
-                vy = math.floor((SH - hv) / 2) }
+                vy = math.floor((vh2 - hv) / 2) }
     end
     geo.scaleLabel = (geo.kind == "zoom")
         and (tostring(geo.z) .. "x" .. ((geo.x0 > 0 or geo.y0 > 0) and " crop" or ""))
@@ -483,6 +537,8 @@ local function openPart(S, p, retries)
     return false
 end
 
+-- reopen `part`, rewind counters to its start and fast-scan forward to
+-- where we were (or to a seek target). no payloads are kept while scanning.
 local function recover(S, savedF, savedA, part)
     for attempt = 1, 6 do
         if S.stop or S.seekReq then return false end
@@ -526,15 +582,31 @@ local function doSeek(S, t)
     S.seeking = true
     S.seekReq = nil
     S.eof = false
-    local targetA = math.max(0, math.floor(t / AUDIO_REC_SEC) + 1)
     local p = 0
-    for i = S.parts - 1, 0, -1 do
-        local sa = S.partStartAudio[i]
-        if sa and sa < targetA then p = i break end
-    end
-    if not S.partStartAudio[p] then
-        S.partStartAudio[p] = 0
-        S.partStartFrame[p] = 0
+    local resumeF, resumeA
+    if S.sepAudio then
+        -- video-only parts: count frames; audio is streamed separately
+        local targetF = math.max(0, math.floor(t * S.fps))
+        for i = S.parts - 1, 0, -1 do
+            local sf = S.partStartFrame[i]
+            if sf and sf <= targetF then p = i break end
+        end
+        if not S.partStartFrame[p] then
+            S.partStartFrame[p] = 0
+            S.partStartAudio[p] = 0
+        end
+        resumeF, resumeA = targetF, nil
+    else
+        local targetA = math.max(0, math.floor(t / AUDIO_REC_SEC) + 1)
+        for i = S.parts - 1, 0, -1 do
+            local sa = S.partStartAudio[i]
+            if sa and sa < targetA then p = i break end
+        end
+        if not S.partStartAudio[p] then
+            S.partStartAudio[p] = 0
+            S.partStartFrame[p] = 0
+        end
+        resumeF, resumeA = nil, targetA
     end
     closeResp(S)
     S.curOpen = false
@@ -542,8 +614,8 @@ local function doSeek(S, t)
     S.frameNo = S.partStartFrame[p]
     S.audioNo = S.partStartAudio[p]
     S.scanOnly = true
-    S.resumeF = nil
-    S.resumeA = targetA
+    S.resumeF = resumeF
+    S.resumeA = resumeA
     if not openPart(S, p, 3) then
         S.seeking = false
     end
@@ -577,6 +649,7 @@ local function downloader(S)
                         closeResp(S)
                         if not S.eof and not S.stop then
                             if not recover(S, S.frameNo, S.audioNo, S.partNo) then
+                                -- keep err; user can press R after fixing
                             end
                         end
                     end
@@ -589,6 +662,105 @@ local function downloader(S)
     closeResp(S)
 end
 
+--------------------------------------------------------------------------
+-- hud layout (shared by renderer + touch hit-testing)
+--------------------------------------------------------------------------
+
+local function hudRects()
+    local y0 = SH - HUD_H
+    return {
+        back  = { 6,        y0 + 12, 30,          16 },
+        play  = { 40,       y0 + 12, 30,          16 },
+        fwd   = { 74,       y0 + 12, 30,          16 },
+        mute  = { SW - 68,  y0 + 12, 30,          16 },
+        quit  = { SW - 34,  y0 + 12, 28,          16 },
+        track = { 112,      y0 + 19, math.max(SW - 190, 40), 5 },
+    }
+end
+
+local function insideRect(px, py, rct)
+    return px >= rct[1] and px <= rct[1] + rct[3]
+       and py >= rct[2] and py <= rct[2] + rct[4]
+end
+
+--------------------------------------------------------------------------
+-- separate-audio streamer (NAME.audio.dfpwm, new-style encodes)
+--------------------------------------------------------------------------
+
+local function audioURL(S)
+    local e = urlenc(S.name)
+    return S.base .. "/" .. e .. "/" .. e .. ".audio.dfpwm"
+end
+
+local function audioStreamer(S)
+    local resp = nil
+    local apos = 0            -- bytes consumed from the file
+    local function close()
+        if resp then pcall(function() resp.close() end) end
+        resp = nil
+        apos = 0
+    end
+    while not S.stop do
+        if S.audioSeekByte then
+            local target = S.audioSeekByte
+            S.audioSeekByte = nil
+            if target < apos then close() end
+            S.audioDiscardTo = target
+        end
+        local discarding = S.audioDiscardTo ~= nil and apos < S.audioDiscardTo
+        if not resp and not S.audioFileDead then
+            local opened = false
+            for attempt = 1, 5 do
+                if S.stop or S.audioSeekByte then break end
+                local r, e = http.get(audioURL(S), nil, true)
+                if r then resp = r opened = true break end
+                local es = tostring(e)
+                if es:find("404") or es:find("Not Found") then
+                    S.audioFileDead = true
+                    break
+                end
+                sleep(math.min(6, attempt))
+            end
+            if not opened and not resp then
+                if not S.audioFileDead then S.audioFileDead = true end
+            end
+        end
+        if resp then
+            if not discarding and S.audioBytes >= AUDIO_CAP then
+                sleep(0.1)
+            else
+                local c = resp.read(16384)
+                if not c then
+                    close()
+                    -- park until a seek asks us to re-stream or playback ends
+                    while not S.stop and not S.audioSeekByte do sleep(0.2) end
+                else
+                    if discarding then
+                        local before = S.audioDiscardTo - apos
+                        apos = apos + #c
+                        if #c > before then
+                            local keep = c:sub(before + 1)
+                            S.audioQ[#S.audioQ + 1] = keep
+                            S.audioBytes = S.audioBytes + #keep
+                            S.audioDiscardTo = nil
+                        end
+                    else
+                        apos = apos + #c
+                        S.audioQ[#S.audioQ + 1] = c
+                        S.audioBytes = S.audioBytes + #c
+                    end
+                end
+            end
+        else
+            sleep(0.2)
+        end
+    end
+    close()
+end
+
+--------------------------------------------------------------------------
+-- player screen
+--------------------------------------------------------------------------
 
 local audioDecoder = nil
 pcall(function()
@@ -597,6 +769,7 @@ pcall(function()
         audioDecoder = lib.make_decoder()
     end
 end)
+-- 0 = try raw dfpwm strings first, 1 = decode to amplitude tables, 2 = no audio
 local SPK_MODE = 0
 
 local function spkStop(spk)
@@ -605,13 +778,16 @@ end
 
 local function player(spk, movie)
     local S = newState(CFG.BASE_URL, movie.name, movie.parts, movie.fps,
-                       movie.dur, movie.metaW, movie.metaH)
+                       movie.dur, movie.metaW, movie.metaH,
+                       movie.sepAudio, movie.pcmAudio)
     local C = {
         pos = 0, t0 = now(), paused = false, muted = false,
         vol = CFG.VOLUME or 1,
         feedAmt = 0, feedMark = now(),
         finished = false, seekPending = nil,
         toast = nil, toastExp = 0,
+        audioSec = 0, dbg = false, audioDeadShown = false,
+        lastInput = now(), slide = 1,
     }
 
     local ditherA, ditherB
@@ -636,11 +812,30 @@ local function player(spk, movie)
     end
 
     local function feedAudio()
-        if not spk or C.paused or C.finished or C.muted or S.seeking then return end
-        while #S.audioQ > 0 and apendingCalc() < SPK_PENDING_MAX do
+        if not spk then
+            if not C.audioDeadShown then
+                C.audioDeadShown = true
+                C.muted = true
+                toast("NO SPEAKER ATTACHED")
+            end
+            return
+        end
+        if not C.spkVerified then
+            C.spkVerified = true
+            C.spkMethods = ""
+            for k2 in pairs(spk) do C.spkMethods = C.spkMethods .. tostring(k2) .. "," end
+        end
+        if C.paused or C.finished or C.muted or S.seeking then return end
+        if SPK_MODE >= 2 then return end
+        -- A/V sync: audio runs behind the video clock by AUDIO_LAG_MS
+        -- (video leads audio) plus the user's fine-tune offset
+        local target = (now() - C.t0) + (CFG.AUDIO_OFFSET or 0) / 1000
+            - (CFG.AUDIO_LAG_MS or 300) / 1000
+        while #S.audioQ > 0 and apendingCalc() < SPK_PENDING_MAX
+            and C.audioSec < target do
             local taken, n = {}, 0
-            local capMax = (SPK_MODE == 1) and 16000 or 32000
-            local capMin = (SPK_MODE == 1) and 8000 or 16000
+            local capMax = (SPK_MODE == 1 or S.pcmAudio) and 16000 or 32000
+            local capMin = (SPK_MODE == 1 or S.pcmAudio) and 8000 or 16000
             while #S.audioQ > 0 and n < capMax do
                 local c = table.remove(S.audioQ, 1)
                 S.audioBytes = S.audioBytes - #c
@@ -650,7 +845,14 @@ local function player(spk, movie)
             end
             local piece = table.concat(taken)
             local payload = piece
-            if SPK_MODE == 1 then
+            if S.pcmAudio then
+                -- already uncompressed amplitudes: just sign-convert bytes
+                payload = {}
+                for i = 1, #piece do
+                    local b2 = piece:byte(i)
+                    payload[i] = b2 < 128 and b2 or b2 - 256
+                end
+            elseif SPK_MODE == 1 then
                 if not audioDecoder then SPK_MODE = 2 end
             end
             if SPK_MODE == 1 and audioDecoder then
@@ -670,15 +872,42 @@ local function player(spk, movie)
                 end
             end
             local ok = false
-            if SPK_MODE < 2 then
-                local callOk, callErr = pcall(spk.playAudio, payload, C.vol)
+            if S.pcmAudio then
+                local callOk = pcall(spk.playAudio, payload, C.vol)
+                if not callOk then
+                    callOk = pcall(spk.playAudio, payload)
+                end
                 if callOk then
                     ok = true
+                    C.lastSpkErr = nil
+                elseif not C.audioDeadShown then
+                    C.audioDeadShown = true
+                    C.muted = true
+                    toast("NO AUDIO SUPPORT")
+                end
+            elseif SPK_MODE < 2 then
+                local callOk, callErr = pcall(spk.playAudio, payload, C.vol)
+                if not callOk then
+                    -- some builds dislike the volume argument
+                    callOk = pcall(spk.playAudio, payload)
+                end
+                if callOk then
+                    ok = true
+                    C.lastSpkErr = nil
                 elseif SPK_MODE == 0 and audioDecoder then
                     SPK_MODE = 1
-                    ok = false
+                elseif SPK_MODE == 1 then
+                    -- one more shot at mode 1 before declaring audio dead
+                    local retryOk = pcall(spk.playAudio, payload)
+                    if retryOk then
+                        ok = true
+                    else
+                        SPK_MODE = 2
+                        C.lastSpkErr = tostring(callErr)
+                    end
                 else
                     SPK_MODE = 2
+                    C.lastSpkErr = tostring(callErr)
                 end
             end
             if SPK_MODE >= 2 and not C.audioDeadShown then
@@ -689,6 +918,7 @@ local function player(spk, movie)
             if ok then
                 C.feedAmt = apendingCalc() + n
                 C.feedMark = now()
+                C.audioSec = C.audioSec + n / 6000
             else
                 for i = #taken, 1, -1 do
                     table.insert(S.audioQ, 1, taken[i])
@@ -706,6 +936,10 @@ local function player(spk, movie)
         C.feedMark = now()
         S.videoQ = {} S.videoBytes = 0
         S.audioQ = {} S.audioBytes = 0
+        C.audioSec = t
+        if S.sepAudio then
+            S.audioSeekByte = math.max(0, math.floor(t * 6000))
+        end
         S.seekReq = t
         S.seeking = true
         C.pos = math.floor(t * S.fps)
@@ -728,26 +962,42 @@ local function player(spk, movie)
     end
 
     local function drawHud(elapsed)
-        local bw = SH - 30
-        fill(0, bw, SW, 30, PANEL)
-        fill(0, bw, SW, 1, PANEL2)
-        drawText(6, bw + 4, fitText(movie.name:upper(), SW * 0.55, 1), LIGHT, PANEL, 1)
-        local tstr = fmtTime(elapsed) .. " / " .. fmtTime(S.dur)
-        drawText(SW - textWidth(tstr, 1) - 6, bw + 4, tstr, GREY, PANEL, 1)
+        local slide = C.slide or 1
+        local off = round((1 - slide) * HUD_H)
+        local bw = SH - HUD_H + off
+        if slide > 0.01 then
+            local R = hudRects()
+            for _, rct in pairs(R) do rct[2] = rct[2] + off end
+            fill(0, bw, SW, HUD_H, PANEL)
+            fill(0, bw, SW, 1, PANEL2)
+            local tstr = fmtTime(elapsed) .. "/" .. fmtTime(S.dur)
+            drawText(R.track[1], bw + 3,
+                fitText(movie.name:upper(), R.track[3], 1), LIGHT, PANEL, 1)
+            drawText(SW - textWidth(tstr, 1) - R.mute[3] - 42, bw + 3,
+                tstr, GREY, PANEL, 1)
 
-        local tx, tw, ty = 6, SW - 12, bw + 14
+            local function btn(r, glyph, active)
+                fill(r[1], r[2], r[3], r[4], active and ACCENT or PANEL2)
+                local gw = textWidth(glyph, 2)
+                drawText(r[1] + math.floor((r[3] - gw) / 2), r[2] + 3, glyph,
+                    active and DEEP or WHITE, active and ACCENT or PANEL2, 2)
+            end
+            btn(R.back, "<", false)
+            btn(R.play, C.paused and ">" or "||", C.paused)
+            btn(R.fwd, ">", false)
+            btn(R.mute, "M", C.muted)
+            btn(R.quit, "X", false)
+
+            local tx, tw, ty = R.track[1], R.track[3], R.track[2]
         fill(tx, ty, tw, 5, DEEP)
         local buffered = clamp((elapsed + (#S.videoQ / S.fps)
-            + S.audioBytes / 6000) / math.max(S.dur, 1), 0, 1)
+            + S.audioBytes / (S.pcmAudio and 48000 or 6000))
+            / math.max(S.dur, 1), 0, 1)
         fill(tx, ty, round(tw * buffered), 5, PANEL2)
         local played = clamp(elapsed / math.max(S.dur, 1), 0, 1)
         fill(tx, ty, round(tw * played), 5, ACCENT)
-        fill(clamp(tx + round(tw * played) - 2, tx, tx + tw - 5), ty - 2, 5, 9, WHITE)
-
-        drawText(6, SH - 8, fitText("SPC PAUSE  <> SEEK  ^V VOL  M MUTE  Q QUIT",
-            SW - 12, 1), GREY, PANEL, 1)
-        if C.muted then
-            drawText(SW - textWidth("MUTED", 1) - 6, SH - 8, "MUTED", ACCENT2, PANEL, 1)
+            fill(clamp(tx + round(tw * played) - 2, tx, tx + tw - 5),
+                ty - 2, 5, 9, WHITE)
         end
 
         if C.paused and not C.finished then
@@ -790,9 +1040,16 @@ local function player(spk, movie)
         end
 
         if C.dbg and S.geo then
-            local info = string.format("GFX %dx%d VID %dx%d %s Q v=%d a=%ds",
+            local info = string.format(
+                "GFX %dx%d VID %dx%d %s Q v=%d a=%ds(%s%s) SYNC %+.1fs DELAY %.1fs SPK m%d %s",
                 SW, SH, S.vw, S.vh, S.geo.scaleLabel,
-                S.videoBytes, S.audioBytes / 6000)
+                S.videoBytes, S.audioBytes / (S.pcmAudio and 48000 or 6000),
+                tostring(S.sepAudio), tostring(S.audioFileDead == true),
+                (CFG.AUDIO_OFFSET or 0) / 1000,
+                (CFG.AUDIO_LAG_MS or 300) / 1000,
+                SPK_MODE,
+                spk and (C.lastSpkErr and ("ERR " .. C.lastSpkErr) or "ok")
+                   or "NO SPEAKER")
             fill(0, SH - 62, SW, 12, DEEP)
             drawText(4, SH - 60, info, GREEN or ACCENT, DEEP, 1)
         end
@@ -831,6 +1088,14 @@ local function player(spk, movie)
             C.seekPending = nil
         end
         feedAudio()
+        local wantHud = C.paused or C.finished or S.err ~= nil
+            or (t - (C.lastInput or 0)) < 5
+        local tgt = wantHud and 1 or 0
+        if math.abs((C.slide or 1) - tgt) > 0.001 then
+            C.slide = C.slide + (tgt - C.slide) * 0.25
+            if math.abs(C.slide - tgt) <= 0.01 then C.slide = tgt end
+            C.hudNext = 0
+        end
         if t >= (C.hudNext or 0) then
             C.hudNext = t + 0.1
             drawHud(C.pos / S.fps)
@@ -847,6 +1112,10 @@ local function player(spk, movie)
     local function control()
     while C.running do
         local ev, p1, p2, p3 = os.pullEventRaw()
+        if ev == "key" or ev == "char" or ev == "monitor_touch"
+           or ev == "mouse_scroll" then
+            C.lastInput = now()
+        end
         if ev == "timer" and p1 == timer then
             tick()
             timer = os.startTimer(0.04)
@@ -874,37 +1143,85 @@ local function player(spk, movie)
             elseif k == keys.f then
                 C.dbg = not C.dbg
                 C.hudNext = 0
+            elseif k == keys.comma or p1 == keys.comma then
+                CFG.AUDIO_OFFSET = clamp((CFG.AUDIO_OFFSET or 0) - 100, -5000, 5000)
+                saveCfg()
+                C.hudNext = 0
+                toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
+            elseif k == keys.period or p1 == keys.period then
+                CFG.AUDIO_OFFSET = clamp((CFG.AUDIO_OFFSET or 0) + 100, -5000, 5000)
+                saveCfg()
+                C.hudNext = 0
+                toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
             elseif k == keys.m then
                 C.muted = not C.muted
                 if C.muted then spkStop(spk) C.feedAmt = 0 end
                 toast(C.muted and "MUTED" or "SOUND ON")
-            elseif k == keys.r and S.err then
+            elseif k == keys.r then
                 S.err = nil
+                S.audioFileDead = nil
+                SPK_MODE = (audioDecoder or SPK_MODE ~= 0) and SPK_MODE or 0
+                C.audioDeadShown = false
+                C.hudNext = 0
             end
         elseif ev == "monitor_touch" then
-            local px = (tonumber(p2) or 1) * 6 - 3
-            local py = (tonumber(p3) or 1) * 9 - 4
-            if C.finished then
-                C.running = false S.stop = true
-            elseif S.err then
-                S.err = nil
-            elseif py > SH - 30 then
-                if px >= 4 and px <= SW - 4 then
-                    seekTo(((px - 6) / (SW - 12)) * S.dur, "SCRUB")
-                else
-                    C.running = false S.stop = true
+            local cx = tonumber(p2) or 0
+            local cy = tonumber(p3) or 0
+            -- different builds report char or pixel coords: test both mappings
+            local pts = {
+                { cx * 6 - 3, cy * 9 - 4 },
+                { cx * 6 + 3, cy * 9 + 4 },
+                { cx, cy },
+            }
+            local R = hudRects()
+            local action, scrubFrac = nil, nil
+            local waking = (C.slide or 1) < 0.95
+            for _, pt in ipairs(pts) do
+                if C.finished then action = "quit"
+                elseif S.err then action = "retry"
+                elseif insideRect(pt, R.back) then action = "back"
+                elseif insideRect(pt, R.play) then action = "toggle"
+                elseif insideRect(pt, R.fwd) then action = "fwd"
+                elseif insideRect(pt, R.mute) then action = "mute"
+                elseif insideRect(pt, R.quit) then action = "quit"
+                elseif insideRect(pt, { 0, SH - HUD_H, SW, HUD_H }) then
+                    if pt[1] >= R.track[1] - 4
+                       and pt[1] <= R.track[1] + R.track[3] + 4 then
+                        action = "scrub"
+                        scrubFrac = clamp(
+                            (pt[1] - R.track[1]) / R.track[3], 0, 1)
+                    end
+                elseif pt[2] <= SH - HUD_H then
+                    if pt[1] < SW / 3 then action = "back"
+                    elseif pt[1] > 2 * SW / 3 then action = "fwd"
+                    else action = "toggle" end
                 end
-            elseif px > SW - 22 and py > SH - 42 then
-                C.running = false S.stop = true
-            else
-                if px < SW / 3 then
-                    seekTo(C.pos / S.fps - 10, "-10S")
-                elseif px > 2 * SW / 3 then
-                    seekTo(C.pos / S.fps + 10, "+10S")
-                else
-                    togglePause()
-                end
+                if action then break end
             end
+            if waking then action = nil end
+            if action == "quit" then
+                C.running = false S.stop = true
+            elseif action == "retry" then
+                S.err = nil C.hudNext = 0
+            elseif action == "toggle" then
+                togglePause()
+            elseif action == "back" then
+                seekTo(C.pos / S.fps - 10, "-10S")
+            elseif action == "fwd" then
+                seekTo(C.pos / S.fps + 10, "+10S")
+            elseif action == "mute" then
+                C.muted = not C.muted
+                if C.muted then spkStop(spk) C.feedAmt = 0 end
+                toast(C.muted and "MUTED" or "SOUND ON")
+            elseif action == "scrub" and scrubFrac then
+                seekTo(scrubFrac * S.dur, "SCRUB")
+            end
+        elseif ev == "char" and (p1 == "," or p1 == ".") then
+            CFG.AUDIO_OFFSET = clamp((CFG.AUDIO_OFFSET or 0)
+                + (p1 == "," and -100 or 100), -5000, 5000)
+            saveCfg()
+            C.hudNext = 0
+            toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
         elseif ev == "speaker_audio_empty" then
             C.feedAmt = 0
             C.feedMark = now()
@@ -915,13 +1232,21 @@ local function player(spk, movie)
     end
     end
 
-    parallel.waitForAny(function() downloader(S) end, control)
+    local threads = { function() downloader(S) end }
+    if S.sepAudio and not S.audioFileDead then
+        threads[#threads + 1] = function() audioStreamer(S) end
+    end
+    threads[#threads + 1] = control
+    parallel.waitForAny(table.unpack(threads))
 
     S.stop = true
     spkStop(spk)
     return C.terminated == true
 end
 
+--------------------------------------------------------------------------
+-- movie list / meta
+--------------------------------------------------------------------------
 
 local function fetchList()
     local txt, err = httpGetText(CFG.BASE_URL .. "/movies.txt")
@@ -954,9 +1279,14 @@ local function fetchMeta(name)
         parts = tonumber(vals[4]) or 1,
         blk = tonumber(vals[5]) or 1,
         mode = tonumber(vals[6]) or 0,
+        hasAudio = tonumber(vals[7]) or 0,
+        pcm = (tonumber(vals[7]) or 0) == 2,
     }
 end
 
+--------------------------------------------------------------------------
+-- menu screen
+--------------------------------------------------------------------------
 
 local ITEM_H = 46
 
@@ -1095,6 +1425,8 @@ local function menuScreen()
             fps = m.fps,
             metaW = m.w,
             metaH = m.h,
+            sepAudio = m.hasAudio == 1,
+            pcmAudio = m.pcm,
         })
         return terminated
     end
@@ -1156,6 +1488,9 @@ local function menuScreen()
     end
 end
 
+--------------------------------------------------------------------------
+-- main
+--------------------------------------------------------------------------
 
 local function findMonitor()
     local best = nil
