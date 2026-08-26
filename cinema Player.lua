@@ -268,19 +268,31 @@ local function makeFrame(S, data)
     local geo = S.geo
     local vw = S.vw
     local rows = {}
-    if geo.dz >= 2 then
-        local z = geo.dz
+    if geo.kind == "zoom" and geo.z >= 2 then
+        local z, x0, y0 = geo.z, geo.x0, geo.y0
+        local want = x0 + geo.w
+        local emitted, skip = 0, y0
         for y = 1, S.vh do
+            if emitted >= geo.h then break end
             local er = expandRow(data:sub((y - 1) * vw + 1, y * vw), z)
-            for k = 1, z do rows[#rows + 1] = er end
+            if #er > want then er = er:sub(x0 + 1, want) end
+            for k = 1, z do
+                if skip > 0 then
+                    skip = skip - 1
+                elseif emitted < geo.h then
+                    rows[#rows + 1] = er
+                    emitted = emitted + 1
+                end
+            end
         end
-    elseif geo.ds >= 2 then
+    elseif geo.kind == "down" then
         local d = geo.ds
         local half = math.ceil(d / 2)
         for y = half, S.vh, d do
-            local src = data:sub((y - 1) * vw + 1, y * vw)
+            if #rows >= geo.h then break end
+            local sr = data:sub((y - 1) * vw + 1, y * vw)
             local acc = {}
-            for x = half, vw, d do acc[#acc + 1] = src:sub(x, x) end
+            for x = half, vw, d do acc[#acc + 1] = sr:sub(x, x) end
             rows[#rows + 1] = table.concat(acc)
         end
     else
@@ -354,20 +366,33 @@ local function initDims(S, size)
     end
     S.vw = bestW
     S.vh = size / bestW
-    local z = math.min(math.floor(SW / S.vw), math.floor(SH / S.vh))
-    local dz, ds = 1, 1
-    if z >= 2 then
-        if CFG.AUTO_ZOOM then dz = math.min(z, 4) end
-    elseif z < 1 then
-        ds = math.max(math.ceil(S.vw / SW), math.ceil(S.vh / SH))
+    local f = math.min(SW / S.vw, SH / S.vh)
+    local geo
+    if f < 0.75 then
+        local ds = math.max(math.ceil(1 / f), 1)
+        local dw, dh = round(S.vw / ds), round(S.vh / ds)
+        geo = { kind = "down", ds = ds,
+                vx = math.floor((SW - dw) / 2), vy = math.floor((SH - dh) / 2),
+                w = dw, h = dh, z = 1 }
+    else
+        local z = 1
+        if CFG.AUTO_ZOOM ~= false then z = math.max(1, math.floor(f + 0.5)) end
+        local dw, dh = S.vw * z, S.vh * z
+        local x0 = math.floor((dw - SW) / 2)
+        if x0 < 0 then x0 = 0 end
+        local y0 = math.floor((dh - SH) / 2)
+        if y0 < 0 then y0 = 0 end
+        local wv = math.min(dw - x0, SW)
+        local hv = math.min(dh - y0, SH)
+        geo = { kind = "zoom", z = z,
+                x0 = x0, y0 = y0, w = wv, h = hv,
+                vx = math.floor((SW - wv) / 2),
+                vy = math.floor((SH - hv) / 2) }
     end
-    local dw = (dz >= 2) and S.vw * dz or round(S.vw / ds)
-    local dh = (dz >= 2) and S.vh * dz or round(S.vh / ds)
-    S.geo = {
-        dz = dz, ds = ds,
-        vx = math.floor((SW - dw) / 2),
-        vy = math.floor((SH - dh) / 2),
-    }
+    geo.scaleLabel = (geo.kind == "zoom")
+        and (tostring(geo.z) .. "x" .. ((geo.x0 > 0 or geo.y0 > 0) and " crop" or ""))
+        or ("1/" .. tostring(geo.ds))
+    S.geo = geo
 end
 
 local function completeFrame(S)
@@ -764,6 +789,14 @@ local function player(spk, movie)
             drawSpinner(SW - 30, SH - 50, "BUFFERING")
         end
 
+        if C.dbg and S.geo then
+            local info = string.format("GFX %dx%d VID %dx%d %s Q v=%d a=%ds",
+                SW, SH, S.vw, S.vh, S.geo.scaleLabel,
+                S.videoBytes, S.audioBytes / 6000)
+            fill(0, SH - 62, SW, 12, DEEP)
+            drawText(4, SH - 60, info, GREEN or ACCENT, DEEP, 1)
+        end
+
         if C.toast and now() < C.toastExp then
             local m = C.toast
             local mw = textWidth(m, 2)
@@ -838,6 +871,9 @@ local function player(spk, movie)
                 C.vol = clamp(C.vol - 0.25, 0, 3)
                 CFG.VOLUME = C.vol saveCfg()
                 toast("VOL " .. round(C.vol * 100) .. "%")
+            elseif k == keys.f then
+                C.dbg = not C.dbg
+                C.hudNext = 0
             elseif k == keys.m then
                 C.muted = not C.muted
                 if C.muted then spkStop(spk) C.feedAmt = 0 end
