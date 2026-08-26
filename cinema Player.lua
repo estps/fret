@@ -616,6 +616,20 @@ end
 -- player screen
 --------------------------------------------------------------------------
 
+local audioDecoder = nil
+pcall(function()
+    local lib = require("cc.audio.dfpwm")
+    if type(lib) == "table" and type(lib.make_decoder) == "function" then
+        audioDecoder = lib.make_decoder()
+    end
+end)
+-- 0 = try raw dfpwm strings first, 1 = decode to amplitude tables, 2 = no audio
+local SPK_MODE = 0
+
+local function spkStop(spk)
+    if spk then pcall(function() spk.stop() end) end
+end
+
 local function player(spk, movie)
     local S = newState(CFG.BASE_URL, movie.name, movie.parts, movie.fps,
                        movie.dur, movie.metaW, movie.metaH)
@@ -652,15 +666,45 @@ local function player(spk, movie)
         if not spk or C.paused or C.finished or C.muted or S.seeking then return end
         while #S.audioQ > 0 and apendingCalc() < SPK_PENDING_MAX do
             local taken, n = {}, 0
-            while #S.audioQ > 0 and n < 32000 do
+            local capMax = (SPK_MODE == 1) and 16000 or 32000
+            local capMin = (SPK_MODE == 1) and 8000 or 16000
+            while #S.audioQ > 0 and n < capMax do
                 local c = table.remove(S.audioQ, 1)
                 S.audioBytes = S.audioBytes - #c
                 taken[#taken + 1] = c
                 n = n + #c
-                if n >= 16000 then break end
+                if n >= capMin then break end
             end
             local piece = table.concat(taken)
-            local ok = spk.playAudio(piece, C.vol)
+            local payload = piece
+            if SPK_MODE == 1 then
+                if not audioDecoder then SPK_MODE = 2 end
+            end
+            if SPK_MODE == 1 and audioDecoder then
+                local pcm = audioDecoder(piece)
+                payload = {}
+                for i = 1, #pcm do
+                    local b = pcm:byte(i)
+                    payload[i] = b < 128 and b or b - 256
+                end
+            end
+            local ok = false
+            if SPK_MODE < 2 then
+                local callOk, callErr = pcall(spk.playAudio, payload, C.vol)
+                if callOk then
+                    ok = true
+                elseif SPK_MODE == 0 and audioDecoder then
+                    SPK_MODE = 1
+                    ok = false
+                else
+                    SPK_MODE = 2
+                end
+            end
+            if SPK_MODE >= 2 and not C.audioDeadShown then
+                C.audioDeadShown = true
+                C.muted = true
+                toast("NO AUDIO SUPPORT")
+            end
             if ok then
                 C.feedAmt = apendingCalc() + n
                 C.feedMark = now()
@@ -676,7 +720,7 @@ local function player(spk, movie)
 
     local function seekTo(t, label)
         t = clamp(t, 0, math.max(0, S.dur - 0.5))
-        if spk then spk.stop() end
+        spkStop(spk)
         C.feedAmt = 0
         C.feedMark = now()
         S.videoQ = {} S.videoBytes = 0
@@ -695,7 +739,7 @@ local function player(spk, movie)
         C.paused = not C.paused
         C.hudNext = 0
         if C.paused then
-            if spk then spk.stop() end
+            spkStop(spk)
             C.feedAmt = 0
         else
             C.t0 = now() - C.pos / S.fps
@@ -777,7 +821,7 @@ local function player(spk, movie)
         if S.eof and #S.videoQ == 0 and not C.finished then
             C.finished = true
             C.hudNext = 0
-            if spk then spk.stop() end
+            spkStop(spk)
         end
         if not C.paused and not C.finished and not S.seeking then
             local due = math.floor((t - C.t0) * S.fps)
@@ -840,7 +884,7 @@ local function player(spk, movie)
                 toast("VOL " .. round(C.vol * 100) .. "%")
             elseif k == keys.m then
                 C.muted = not C.muted
-                if C.muted and spk then spk.stop() C.feedAmt = 0 end
+                if C.muted then spkStop(spk) C.feedAmt = 0 end
                 toast(C.muted and "MUTED" or "SOUND ON")
             elseif k == keys.r and S.err then
                 S.err = nil
@@ -882,7 +926,7 @@ local function player(spk, movie)
     parallel.waitForAny(function() downloader(S) end, control)
 
     S.stop = true
-    if spk then pcall(function() spk.stop() end) end
+    spkStop(spk)
     return C.terminated == true
 end
 
@@ -1198,9 +1242,29 @@ local function main()
     if quit then return end
 end
 
-local ok, err = pcall(main)
-cleanup(findMonitor())
-if not ok then
+local function crashCard(err)
+    local mon = findMonitor()
+    cleanup(mon)
     term.setTextColor(colors.red)
     print("\n[cinema] crashed: " .. tostring(err))
+    pcall(function()
+        if not mon then return end
+        term.redirect(mon.p)
+        term.setBackgroundColour(colors.black)
+        term.setTextColour(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("CC CINEMA CRASHED\n")
+        local msg = tostring(err)
+        local w = select(1, term.getSize())
+        while #msg > 0 do
+            print(msg:sub(1, w))
+            msg = msg:sub(w + 1)
+        end
+    end)
+end
+
+local ok, err = pcall(main)
+if not ok then
+    crashCard(err)
 end
