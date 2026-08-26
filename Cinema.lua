@@ -1453,9 +1453,11 @@ local function play(NAME)
         for i = 1, #set do SHADE_CHARS[tostring(i - 1)] = set:sub(i, i) end
     end
 
+    local renderMs, fpsT, fpsN = 0, os.clock(), 0
     local function render(frame, glyphs)
         if PIXEL then
             initGfx()
+            local t0 = os.clock()
             -- frames arrive pre-quantised (1 palette index per pixel):
             -- slicing into rows is all that's left to do per frame
             local rows = {}
@@ -1464,7 +1466,11 @@ local function play(NAME)
                     rows[y] = frame:sub((y - 1) * cw + 1, y * cw)
                 end
             end
+            pcall(function() mon.setFrozen(true) end)
             mon.drawPixels(gfxOx, gfxOy, rows)
+            pcall(function() mon.setFrozen(false) end)
+            renderMs = renderMs == 0 and (os.clock() - t0) * 1000
+                or renderMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
             return
         end
         local y = 1
@@ -1774,15 +1780,12 @@ local function play(NAME)
 
     -- player thread: decode/render only, NEVER touches http or disk writes
     local function playerLoop()
-    local lastB, lastT = -1, os.clock()
-    while not abortPlay and nextPart <= lastPart and bufferedAhead() < PREFILL do
-        local b = bufferedAhead()
-        if b ~= lastB then lastB, lastT = b, os.clock() end
-        uiStatusThrottled("buffering")
-        if totalFree() < 3000000 then break end
-        if (os.clock() - lastT > 5) and b >= PART_LOW then
-            break
-        end
+    -- start as soon as the FIRST part is on disk - no need to wait for a
+    -- huge prefill (which the download headroom rules may never reach)
+    local t0buf = os.clock()
+    while not abortPlay and not fs.exists(pname(curPart)) do
+        uiStatusThrottled("downloading")
+        if os.clock() - t0buf > 60 then break end
         waitEvents(0.05)
     end
     speedT0 = os.clock()
@@ -1904,6 +1907,12 @@ local function play(NAME)
         end
 
         local nowC = os.clock()
+        fpsN = fpsN + 1
+        if nowC - fpsT > 1 then
+            dbg(("render %.1f ms/frame | %.1f fps | buffer %.1f MB")
+                :format(renderMs, fpsN / (nowC - fpsT), bufferedAhead(2) / 1e6))
+            fpsT, fpsN = nowC, 0
+        end
         if nowC - lastIter < 0.004 then sleep(0.005) end
         lastIter = nowC
     end
