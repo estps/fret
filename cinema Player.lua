@@ -148,7 +148,8 @@ local function drawRow(x, y, s)
     if ROW_STRINGS then
         term.drawPixels(x, y, s)
     else
-        term.drawPixels(x, y, { s:byte(1, #s) })
+        -- this build wants a list of rows; each row is a list of palette ids
+        term.drawPixels(x, y, { { s:byte(1, #s) } })
     end
 end
 
