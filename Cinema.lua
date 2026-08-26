@@ -1174,11 +1174,12 @@ local function play(NAME)
     local lastPartSz = 0
 
     local bufCache, bufAt = 0, 0
-    local function bufferedAhead()
-        -- walking every part with fs.getSize is expensive on long movies,
-        -- so serve a quarter-second-stale cached value instead
+    local function bufferedAhead(ttlArg)
+        -- walking every part with fs.getSize is expensive: serve a cached
+        -- value and only re-walk the filesystem once per ttl seconds
+        local ttl = ttlArg or 1
         local now = os.clock()
-        if now - bufAt < 0.25 then return bufCache end
+        if now - bufAt < ttl then return bufCache end
         local total = 0
         for i = 0, nextPart - 1 do
             local f = pname(i)
@@ -1317,10 +1318,10 @@ local function play(NAME)
     end
 
     local function pump(target)
-        -- the bufferedAhead() cache is for UI only: download decisions need
-        -- EXACT numbers, or a stale low reading makes pump stampede new
-        -- requests past the target and fill the disk
-        bufAt = 0
+        -- NOTE: never force an exact bufferedAhead() recount here - walking
+        -- fs.getSize over every part stalls the whole computer; the 0.25s
+        -- cached value is plenty accurate now that this runs in its own
+        -- thread away from rendering
         local k = 1
         while k <= #dls do
             local d = dls[k]
@@ -1432,6 +1433,15 @@ local function play(NAME)
             local fh = fs.open(tmp, "wb")
             dls[#dls + 1] = { idx = nextPart, res = res2, fh = fh, tmp = tmp }
             nextPart = nextPart + 1
+        end
+    end
+
+    -- downloader thread: owns ALL http/disk work so rendering never blocks
+    local function downloader()
+        while not abortPlay do
+            pump(PLAY_AHEAD)
+            if nextPart > lastPart and #dls == 0 then break end
+            sleep(0.05)
         end
     end
 
@@ -1762,9 +1772,10 @@ local function play(NAME)
         sweepBuffers()
     end
 
+    -- player thread: decode/render only, NEVER touches http or disk writes
+    local function playerLoop()
     local lastB, lastT = -1, os.clock()
     while not abortPlay and nextPart <= lastPart and bufferedAhead() < PREFILL do
-        pump(PREFILL)
         local b = bufferedAhead()
         if b ~= lastB then lastB, lastT = b, os.clock() end
         uiStatusThrottled("buffering")
@@ -1776,18 +1787,12 @@ local function play(NAME)
     end
     speedT0 = os.clock()
     speedB0 = bufferedAhead()
-    if abortPlay then
-        cleanup()
-        mon.setBackgroundColour(colours.black)
-        mon.clear()
-        return
-    end
+    if abortPlay then return end
 
     local function nextRecord()
         while true do
             if not hnd then
                 while not abortPlay and not fs.exists(pname(curPart)) do
-                    pump(PLAY_AHEAD)
                     uiStatusThrottled("rebuffering")
                     waitEvents(0.05)
                 end
@@ -1842,7 +1847,6 @@ local function play(NAME)
                     if not start then start = os.epoch("utc") + 150 end
                     while not abortPlay do
                         if not paused and os.epoch("utc") >= start + fi * frameDur then break end
-                        pump(PLAY_AHEAD)
                         waitEvents(paused and 0.15 or 0.02)
                         if paused then
                             eqTick = eqTick + 1
@@ -1875,7 +1879,6 @@ local function play(NAME)
             if not start then start = os.epoch("utc") + 150 end
             while not abortPlay do
                 if not paused and os.epoch("utc") >= start + fi * frameDur then break end
-                pump(PLAY_AHEAD)
                 waitEvents(paused and 0.15 or 0.02)
                 if paused then
                     eqTick = eqTick + 1
@@ -1900,17 +1903,13 @@ local function play(NAME)
             ai = ai + 1
         end
 
-        pump(PLAY_AHEAD)
         local nowC = os.clock()
         if nowC - lastIter < 0.004 then sleep(0.005) end
         lastIter = nowC
     end
-
-    if not abortPlay then
-        while #pendingAudio > 0 and sp do
-            playAudioChunk(table.remove(pendingAudio, 1))
-        end
     end
+
+    parallel.waitForAny(playerLoop, downloader)
 
     cleanup()
     if PIXEL then
