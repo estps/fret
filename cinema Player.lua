@@ -966,8 +966,7 @@ local function player(spk, movie)
         C.pos = math.floor(t * S.fps)
         C.seekPending = t
         C.finished = false
-        collectgarbage("collect")
-        toast(label or "SEEK")
+                toast(label or "SEEK")
     end
 
     local function togglePause()
@@ -1590,8 +1589,7 @@ local function menuScreen()
             return
         end
 
-        collectgarbage("collect")
-        local okD, desc, thumb = pcall(fetchExtras, item.name)
+                local okD, desc, thumb = pcall(fetchExtras, item.name)
         if okD and ((desc and #desc > 0) or thumb) then
             render()
             if not infoScreen(item, m, desc, thumb) then
