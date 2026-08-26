@@ -1115,7 +1115,7 @@ local oldScale = nil
 local function cleanup(mon)
     pcall(function()
         term.setGraphicsMode(false)
-        if mon and oldScale then mon.setTextScale(oldScale) end
+        if mon and mon.p and oldScale then mon.p.setTextScale(oldScale) end
         term.clear()
     end)
     pcall(function() term.restore() end)
@@ -1135,9 +1135,9 @@ local function main()
     print("[cinema] monitor: " .. mon.name)
     print("[cinema] server : " .. CFG.BASE_URL)
 
-    pcall(function() oldScale = mon.getTextScale() end)
-    pcall(function() mon.setTextScale(CFG.TEXT_SCALE or 0.5) end)
-    term.redirect(mon)
+    pcall(function() oldScale = mon.p.getTextScale() end)
+    pcall(function() mon.p.setTextScale(CFG.TEXT_SCALE or 0.5) end)
+    term.redirect(mon.p)
 
     if not term.setGraphicsMode then
         term.restore()
