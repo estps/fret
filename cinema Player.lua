@@ -1307,6 +1307,64 @@ local function fetchMeta(name)
 end
 
 --------------------------------------------------------------------------
+-- description / thumbnail extras
+--------------------------------------------------------------------------
+
+local function fetchExtras(name)
+    local e = urlenc(name)
+    local dir = CFG.BASE_URL .. "/" .. e
+    local desc = httpGetText(dir .. "/" .. e .. ".desc.txt")
+    if desc then desc = desc:gsub("\r", "") end
+    local thumb = nil
+    local mt = httpGetText(dir .. "/" .. e .. ".thumb.meta")
+    if mt then
+        local dims = {}
+        for v in mt:gmatch("%d+") do dims[#dims + 1] = tonumber(v) end
+        local tw, th = dims[1] or 128, dims[2] or 72
+        local r = http.get(dir .. "/" .. e .. ".thumb", nil, true)
+        if r then
+            local data = r.readAll()
+            pcall(function() r.close() end)
+            if data and #data >= tw * th then
+                thumb = { w = tw, h = th, data = data:sub(1, tw * th) }
+            end
+        end
+    end
+    return desc, thumb
+end
+
+local function wrapText(s, maxChars)
+    local out = {}
+    for para in (s .. "\n"):gmatch("([^\n]*)\n") do
+        if para == "" then
+            out[#out + 1] = ""
+        else
+            local line = ""
+            for word0 in para:gmatch("%S+") do
+                local word = word0
+                while #word > maxChars do
+                    if line ~= "" then
+                        out[#out + 1] = line
+                        line = ""
+                    end
+                    out[#out + 1] = word:sub(1, maxChars)
+                    word = word:sub(maxChars + 1)
+                end
+                if #line == 0 then line = word
+                elseif #line + 1 + #word <= maxChars then
+                    line = line .. " " .. word
+                else
+                    out[#out + 1] = line
+                    line = word
+                end
+            end
+            out[#out + 1] = line
+        end
+    end
+    return out
+end
+
+--------------------------------------------------------------------------
 -- menu screen
 --------------------------------------------------------------------------
 
@@ -1421,6 +1479,97 @@ local function menuScreen()
         drawText(SW - textWidth(posStr, 1) - 8, SH - 11, posStr, LIGHT, PANEL, 1)
     end
 
+    local function infoScreen(item, m, desc, thumb)
+        local lines = {}
+        if desc and #desc > 0 then
+            lines = wrapText(desc:upper(), math.floor((SW - 60) / 4))
+        end
+        local view = 0
+
+        -- prepare scaled thumbnail rows once
+        local trows, tw2, th2
+        if thumb then
+            tw2, th2 = thumb.w, thumb.h
+            local z = math.max(1, math.floor(math.min((SW - 80) / tw2,
+                120 / th2)))
+            tw2, th2 = tw2 * z, th2 * z
+            trows = {}
+            for y = 1, thumb.h do
+                local row = thumb.data:sub((y - 1) * thumb.w + 1,
+                                           y * thumb.w)
+                row = expandRow(row, z)
+                for k = 1, z do trows[#trows + 1] = row end
+            end
+        end
+
+        local irender = function()
+            fill(0, 0, SW, SH, BG)
+            drawText(10, 6, fitText(item.name:upper(), SW - 20, 2),
+                WHITE, BG, 2)
+            drawText(10, 20, fmtTime(m.fps and item.dur or item.dur or 0)
+                .. "   " .. tostring(m.parts) .. " PARTS",
+                GREY, BG, 1)
+            fill(0, 30, SW, 1, PANEL2)
+
+            local ty = 38
+            if trows then
+                fill(8, ty - 2, tw2 + 4, th2 + 4, PANEL)
+                term.drawPixels(10, ty, trows)
+                ty = ty + th2 + 12
+            end
+            local availH = SH - 34 - ty
+            local maxVis = math.max(1, math.floor(availH / 7))
+            view = clamp(view, 0, math.max(0, #lines - maxVis))
+            for i = 1, maxVis do
+                local ln = lines[view + i]
+                if not ln then break end
+                drawText(10, ty + (i - 1) * 7 - 1, ln, LIGHT, BG, 1)
+            end
+            if #lines > maxVis then
+                local barH = math.max(10, math.floor(availH *
+                    maxVis / #lines))
+                local barY = ty + math.floor((availH - barH) *
+                    (view / math.max(1, #lines - maxVis)))
+                fill(SW - 8, ty, 4, availH, PANEL)
+                fill(SW - 8, barY, 4, barH, ACCENT)
+            end
+            fill(0, SH - 26, SW, 26, PANEL)
+            centerText(SH - 18, "ENTER PLAY      UP/DOWN SCROLL      ESC BACK",
+                GREY, PANEL, 1)
+        end
+
+        irender()
+        while true do
+            local ev, p1 = os.pullEventRaw()
+            if ev == "key" then
+                if p1 == keys.enter or p1 == keys.space then
+                    return true
+                elseif p1 == keys.escape or p1 == keys.q
+                    or p1 == keys.backspace then
+                    return false
+                elseif p1 == keys.up and view > 0 then
+                    view = view - 3
+                    irender()
+                elseif p1 == keys.down and view < math.max(0, #lines - 1) then
+                    view = view + 3
+                    irender()
+                end
+            elseif ev == "mouse_scroll" then
+                view = clamp(view + p1 * 3, 0, math.max(0, #lines))
+                irender()
+            elseif ev == "monitor_touch" then
+                local py = (tonumber(p2) or 1) * 9
+                if py > SH - 30 then
+                    return true
+                end
+                view = clamp(view + 3, 0, math.max(0, #lines))
+                irender()
+            elseif ev == "terminate" then
+                return false
+            end
+        end
+    end
+
     local function play(item)
         local m = fetchMeta(item.name)
         if not m then
@@ -1439,6 +1588,16 @@ local function menuScreen()
             })
             sleep(2.5)
             return
+        end
+
+        collectgarbage("collect")
+        local okD, desc, thumb = pcall(fetchExtras, item.name)
+        if okD and ((desc and #desc > 0) or thumb) then
+            render()
+            if not infoScreen(item, m, desc, thumb) then
+                render()
+                return
+            end
         end
         local terminated = player(peripheral.find("speaker"), {
             name = item.name,
