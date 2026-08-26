@@ -831,11 +831,27 @@ local function player(spk, movie)
         -- (video leads audio) plus the user's fine-tune offset
         local target = (now() - C.t0) + (CFG.AUDIO_OFFSET or 0) / 1000
             - (CFG.AUDIO_LAG_MS or 300) / 1000
-        while #S.audioQ > 0 and apendingCalc() < SPK_PENDING_MAX
-            and C.audioSec < target do
+
+        -- old builds never raise speaker_audio_empty, so wall-clock pending
+        -- estimates lie about how much has drained. if no drain event has
+        -- shown up after a few pieces, switch to small pieces paced purely
+        -- by the video clock (the sync gate below makes overshoot impossible)
+        if not C.sawEmpty and not C.legacyPacing then
+            C.feedOk = (C.feedOk or 0) + 1
+            if C.feedOk >= 15 then C.legacyPacing = true end
+        end
+        local legacy = C.legacyPacing
+        local capMax = ((SPK_MODE == 1 or S.pcmAudio) and
+            (legacy and 4000 or 16000)) or (legacy and 8000 or 32000)
+        local capMin = ((SPK_MODE == 1 or S.pcmAudio) and
+            (legacy and 2000 or 8000)) or (legacy and 4000 or 16000)
+
+        local pieces = 0
+        while #S.audioQ > 0
+            and (legacy or apendingCalc() < SPK_PENDING_MAX)
+            and C.audioSec < target
+            and pieces < (legacy and 6 or 64) do
             local taken, n = {}, 0
-            local capMax = (SPK_MODE == 1 or S.pcmAudio) and 16000 or 32000
-            local capMin = (SPK_MODE == 1 or S.pcmAudio) and 8000 or 16000
             while #S.audioQ > 0 and n < capMax do
                 local c = table.remove(S.audioQ, 1)
                 S.audioBytes = S.audioBytes - #c
@@ -916,9 +932,14 @@ local function player(spk, movie)
                 toast("NO AUDIO SUPPORT")
             end
             if ok then
-                C.feedAmt = apendingCalc() + n
-                C.feedMark = now()
-                C.audioSec = C.audioSec + n / 6000
+                pieces = pieces + 1
+                if S.pcmAudio then
+                    C.audioSec = C.audioSec + n / 48000
+                else
+                    C.audioSec = C.audioSec + n / 6000
+                    C.feedAmt = apendingCalc() + n
+                    C.feedMark = now()
+                end
             else
                 for i = #taken, 1, -1 do
                     table.insert(S.audioQ, 1, taken[i])
@@ -1223,6 +1244,7 @@ local function player(spk, movie)
             C.hudNext = 0
             toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
         elseif ev == "speaker_audio_empty" then
+            C.sawEmpty = true
             C.feedAmt = 0
             C.feedMark = now()
         elseif ev == "terminate" then
