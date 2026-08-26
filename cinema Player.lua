@@ -20,7 +20,6 @@ local RED     = 248
 local DEEP    = 250
 local BLACK   = 0
 
-local HUD_H = 30
 
 local CFG = { BASE_URL = "", VOLUME = 1.0, TEXT_SCALE = 0.5, AUTO_ZOOM = true, AUDIO_OFFSET = 0, AUDIO_LAG_MS = 300 }
 
@@ -372,7 +371,7 @@ local function initDims(S, size)
     end
     S.vw = bestW
     S.vh = size / bestW
-    local vh2 = SH - HUD_H
+    local vh2 = SH
     local f = math.min(SW / S.vw, vh2 / S.vh)
     local geo
     if f < 0.75 then
@@ -612,24 +611,6 @@ local function downloader(S)
 end
 
 
-local function hudRects()
-    local y0 = SH - HUD_H
-    return {
-        back  = { 6,        y0 + 12, 30,          16 },
-        play  = { 40,       y0 + 12, 30,          16 },
-        fwd   = { 74,       y0 + 12, 30,          16 },
-        mute  = { SW - 68,  y0 + 12, 30,          16 },
-        quit  = { SW - 34,  y0 + 12, 28,          16 },
-        track = { 112,      y0 + 19, math.max(SW - 190, 40), 5 },
-    }
-end
-
-local function insideRect(px, py, rct)
-    return px >= rct[1] and px <= rct[1] + rct[3]
-       and py >= rct[2] and py <= rct[2] + rct[4]
-end
-
-
 local function audioURL(S)
     local e = urlenc(S.name)
     return S.base .. "/" .. e .. "/" .. e .. ".audio.dfpwm"
@@ -725,7 +706,6 @@ local function player(spk, movie)
         finished = false, seekPending = nil,
         toast = nil, toastExp = 0,
         audioSec = 0, dbg = false, audioDeadShown = false,
-        lastInput = now(), slide = 1,
     }
 
     local ditherA, ditherB
@@ -911,47 +891,9 @@ local function player(spk, movie)
     end
 
     local function drawHud(elapsed)
-        local slide = C.slide or 1
-        local off = round((1 - slide) * HUD_H)
-        local bw = SH - HUD_H + off
-        if slide > 0.01 then
-            local R = hudRects()
-            for _, rct in pairs(R) do rct[2] = rct[2] + off end
-            fill(0, bw, SW, HUD_H, PANEL)
-            fill(0, bw, SW, 1, PANEL2)
-            local tstr = fmtTime(elapsed) .. "/" .. fmtTime(S.dur)
-            drawText(R.track[1], bw + 3,
-                fitText(movie.name:upper(), R.track[3], 1), LIGHT, PANEL, 1)
-            drawText(SW - textWidth(tstr, 1) - R.mute[3] - 42, bw + 3,
-                tstr, GREY, PANEL, 1)
-
-            local function btn(r, glyph, active)
-                fill(r[1], r[2], r[3], r[4], active and ACCENT or PANEL2)
-                local gw = textWidth(glyph, 2)
-                drawText(r[1] + math.floor((r[3] - gw) / 2), r[2] + 3, glyph,
-                    active and DEEP or WHITE, active and ACCENT or PANEL2, 2)
-            end
-            btn(R.back, "<", false)
-            btn(R.play, C.paused and ">" or "||", C.paused)
-            btn(R.fwd, ">", false)
-            btn(R.mute, "M", C.muted)
-            btn(R.quit, "X", false)
-
-            local tx, tw, ty = R.track[1], R.track[3], R.track[2]
-        fill(tx, ty, tw, 5, DEEP)
-        local buffered = clamp((elapsed + (#S.videoQ / S.fps)
-            + S.audioBytes / (S.pcmAudio and 48000 or 6000))
-            / math.max(S.dur, 1), 0, 1)
-        fill(tx, ty, round(tw * buffered), 5, PANEL2)
-        local played = clamp(elapsed / math.max(S.dur, 1), 0, 1)
-        fill(tx, ty, round(tw * played), 5, ACCENT)
-            fill(clamp(tx + round(tw * played) - 2, tx, tx + tw - 5),
-                ty - 2, 5, 9, WHITE)
-        end
-
         if C.paused and not C.finished then
             if not ditherA or #ditherA ~= SW then buildDither(SW) end
-            for y = 0, SH - 31 do
+            for y = 0, SH - 1 do
                 drawRow(0, y, (y % 2 == 0) and ditherA or ditherB)
             end
             local pw = textWidth("PAUSED", 4)
@@ -963,7 +905,7 @@ local function player(spk, movie)
         end
 
         if C.finished then
-            fill(0, 0, SW, SH - 30, DEEP)
+            fill(0, 0, SW, SH, DEEP)
             local msgs = {
                 { "PLAYBACK FINISHED", 3, WHITE },
                 { fitText(movie.name:upper(), SW - 40, 2), 2, LIGHT },
@@ -971,7 +913,7 @@ local function player(spk, movie)
             }
             local tot = 0
             for _, m in ipairs(msgs) do tot = tot + m[2] * 5 + 12 end
-            local y = round((SH - 30 - tot) / 2)
+            local y = round((SH - tot) / 2)
             for _, m in ipairs(msgs) do
                 drawText(round(SW / 2 - textWidth(m[1], m[2]) / 2), y, m[1], m[3], DEEP, m[2])
                 y = y + m[2] * 5 + 12
@@ -1037,14 +979,6 @@ local function player(spk, movie)
             C.seekPending = nil
         end
         feedAudio()
-        local wantHud = C.paused or C.finished or S.err ~= nil
-            or (t - (C.lastInput or 0)) < 5
-        local tgt = wantHud and 1 or 0
-        if math.abs((C.slide or 1) - tgt) > 0.001 then
-            C.slide = C.slide + (tgt - C.slide) * 0.25
-            if math.abs(C.slide - tgt) <= 0.01 then C.slide = tgt end
-            C.hudNext = 0
-        end
         if t >= (C.hudNext or 0) then
             C.hudNext = t + 0.1
             drawHud(C.pos / S.fps)
@@ -1061,10 +995,6 @@ local function player(spk, movie)
     local function control()
     while C.running do
         local ev, p1, p2, p3 = os.pullEventRaw()
-        if ev == "key" or ev == "char" or ev == "monitor_touch"
-           or ev == "mouse_scroll" then
-            C.lastInput = now()
-        end
         if ev == "timer" and p1 == timer then
             tick()
             timer = os.startTimer(0.04)
@@ -1121,32 +1051,19 @@ local function player(spk, movie)
                 { cx * 6 + 3, cy * 9 + 4 },
                 { cx, cy },
             }
-            local R = hudRects()
-            local action, scrubFrac = nil, nil
-            local waking = (C.slide or 1) < 0.95
+            local action = nil
             for _, pt in ipairs(pts) do
                 if C.finished then action = "quit"
                 elseif S.err then action = "retry"
-                elseif insideRect(pt, R.back) then action = "back"
-                elseif insideRect(pt, R.play) then action = "toggle"
-                elseif insideRect(pt, R.fwd) then action = "fwd"
-                elseif insideRect(pt, R.mute) then action = "mute"
-                elseif insideRect(pt, R.quit) then action = "quit"
-                elseif insideRect(pt, { 0, SH - HUD_H, SW, HUD_H }) then
-                    if pt[1] >= R.track[1] - 4
-                       and pt[1] <= R.track[1] + R.track[3] + 4 then
-                        action = "scrub"
-                        scrubFrac = clamp(
-                            (pt[1] - R.track[1]) / R.track[3], 0, 1)
-                    end
-                elseif pt[2] <= SH - HUD_H then
+                elseif pt[1] > SW - 22 and pt[2] > SH - 42 then
+                    action = "quit"
+                elseif pt[2] <= SH then
                     if pt[1] < SW / 3 then action = "back"
                     elseif pt[1] > 2 * SW / 3 then action = "fwd"
                     else action = "toggle" end
                 end
                 if action then break end
             end
-            if waking then action = nil end
             if action == "quit" then
                 C.running = false S.stop = true
             elseif action == "retry" then
@@ -1157,19 +1074,7 @@ local function player(spk, movie)
                 seekTo(C.pos / S.fps - 10, "-10S")
             elseif action == "fwd" then
                 seekTo(C.pos / S.fps + 10, "+10S")
-            elseif action == "mute" then
-                C.muted = not C.muted
-                if C.muted then spkStop(spk) C.feedAmt = 0 end
-                toast(C.muted and "MUTED" or "SOUND ON")
-            elseif action == "scrub" and scrubFrac then
-                seekTo(scrubFrac * S.dur, "SCRUB")
             end
-        elseif ev == "char" and (p1 == "," or p1 == ".") then
-            CFG.AUDIO_OFFSET = clamp((CFG.AUDIO_OFFSET or 0)
-                + (p1 == "," and -100 or 100), -5000, 5000)
-            saveCfg()
-            C.hudNext = 0
-            toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
         elseif ev == "speaker_audio_empty" then
             C.sawEmpty = true
             C.feedAmt = 0
