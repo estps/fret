@@ -990,7 +990,7 @@ local function menuScreen()
         fill(0, 0, SW, 42, PANEL)
         fill(0, 42, SW, 1, PANEL2)
         drawText(10, 8, "CC CINEMA", WHITE, PANEL, 3)
-        drawText(10 + textWidth("CC CINEMA", 3) + 12, 18, "CLOUD STREAM",
+        drawText(10 + textWidth("CC CINEMA", 3) + 12, 18, "CLOUD STREAM V4",
             ACCENT, PANEL, 1)
         for x = 0, SW - 1 do
             drawRow(x, 40, string.char(36 * (1 + math.floor(
