@@ -129,6 +129,39 @@ local function httpGetText(url)
     return s
 end
 
+-- some CC:Graphics builds reject string pixel rows and only accept tables of
+-- numbers. probe once, then route every row blit through these helpers.
+local ROW_STRINGS = true
+
+local function probePixelFormat()
+    local ok = pcall(term.drawPixels, 0, 0, "\1\1\1")
+    if not ok then
+        ROW_STRINGS = false
+        ok = pcall(term.drawPixels, 0, 0, { 1, 1, 1 })
+        if not ok then
+            error("CC:Graphics drawPixels accepts neither strings nor tables.", 0)
+        end
+    end
+end
+
+local function drawRow(x, y, s)
+    if ROW_STRINGS then
+        term.drawPixels(x, y, s)
+    else
+        term.drawPixels(x, y, { s:byte(1, #s) })
+    end
+end
+
+local function drawRows(x, y, rows)
+    if ROW_STRINGS then
+        term.drawPixels(x, y, rows)
+    else
+        local t = {}
+        for i = 1, #rows do t[i] = { rows[i]:byte(1, #rows[i]) } end
+        term.drawPixels(x, y, t)
+    end
+end
+
 --------------------------------------------------------------------------
 -- 3x5 pixel font
 --------------------------------------------------------------------------
@@ -200,7 +233,7 @@ local function drawText(x, y, s, fg, bg, scale)
         end
         local rowStr = table.concat(seg)
         for v = 0, scale - 1 do
-            term.drawPixels(x, y + r * scale + v, rowStr)
+            drawRow(x, y + r * scale + v, rowStr)
         end
     end
     return textWidth(s, scale)
@@ -694,7 +727,7 @@ local function player(spk, movie)
         if C.paused and not C.finished then
             if not ditherA or #ditherA ~= SW then buildDither(SW) end
             for y = 0, SH - 31 do
-                term.drawPixels(0, y, (y % 2 == 0) and ditherA or ditherB)
+                drawRow(0, y, (y % 2 == 0) and ditherA or ditherB)
             end
             local pw = textWidth("PAUSED", 4)
             fill(round(SW / 2 - pw / 2) - 16, round(SH / 2) - 26, pw + 32, 44, DEEP)
@@ -754,7 +787,7 @@ local function player(spk, movie)
                 drew = fr
                 C.pos = C.pos + 1
             end
-            if drew then term.drawPixels(S.geo.vx, S.geo.vy, drew.rows) end
+            if drew then drawRows(S.geo.vx, S.geo.vy, drew.rows) end
             if C.pos < due and #S.videoQ == 0 and not S.eof then
                 C.t0 = t - C.pos / S.fps
             end
@@ -925,7 +958,7 @@ local function drawMenuItem(y, item, selected, w)
             seg[#seg + 1] = string.rep(string.char(
                 rows[r]:sub(c, c) == "#" and fg or bgc), 2)
         end
-        term.drawPixels(16, y + 12 + (r - 1) * 2, table.concat(seg))
+        drawRow(16, y + 12 + (r - 1) * 2, table.concat(seg))
     end
     drawText(38, y + 8, fitText(item.name:upper(), w - 150, 2),
         selected and WHITE or LIGHT, bgc, 2)
@@ -965,7 +998,7 @@ local function menuScreen()
         drawText(10 + textWidth("CC CINEMA", 3) + 12, 18, "CLOUD STREAM",
             ACCENT, PANEL, 1)
         for x = 0, SW - 1 do
-            term.drawPixels(x, 40, string.char(36 * (1 + math.floor(
+            drawRow(x, 40, string.char(36 * (1 + math.floor(
                 4 * x / math.max(SW - 1, 1))) + 30))
         end
 
@@ -1144,6 +1177,7 @@ local function main()
         error("CC:Graphics not detected (term.setGraphicsMode missing).", 0)
     end
     term.setGraphicsMode(2)
+    probePixelFormat()
 
     local tw, th = term.getSize()
     local ok2, pw, ph = pcall(term.getSize, 2)
