@@ -1,33 +1,13 @@
-------------------------------------------------------------------------------
--- CC CINEMA - cloud video player for CC:Tweaked + CC:Graphics
---
--- Plays movies produced by prepare.py (render mode 3 = GFX pixel stream).
---
--- SERVER SETUP (on your PC, inside the movie folder):
---   python3 -m http.server 8080
---   cloudflared tunnel --url http://localhost:8080
---   copy the https://xxxx.trycloudflare.com URL it prints
---
--- IN GAME:
---   cinema        first run asks for the tunnel URL (saved to /cinema.cfg)
---
--- CONTROLS:
---   menu : UP/DOWN select | ENTER play | U url | R refresh | ESC quit
---   play : SPACE pause | LEFT/RIGHT +-10s | UP/DOWN volume | M mute | Q quit
---   touch: left third -10s | middle pause | right third +10s
---          progress bar scrubs | bottom-right corner stops
-------------------------------------------------------------------------------
 
 local CFG_PATH = "/cinema.cfg"
 
-local CHUNK           = 65000     -- must match prepare.py
-local AUDIO_REC_SEC   = 0.25      -- one type-4 record = 0.25 s
-local VIDEO_CAP       = 1400000   -- ram budget: buffered video frames
-local AUDIO_CAP       = 720000    -- ram budget: buffered audio (~2 min)
-local SPK_PENDING_MAX = 64000     -- bytes queued in the speaker at once
+local CHUNK           = 65000
+local AUDIO_REC_SEC   = 0.25
+local VIDEO_CAP       = 1400000
+local AUDIO_CAP       = 720000
+local SPK_PENDING_MAX = 64000
 local READ_BLOCK      = 32768
 
--- ui palette slots (video uses 0..215, the 6x6x6 cube)
 local BG      = 240
 local PANEL   = 241
 local PANEL2  = 242
@@ -44,9 +24,6 @@ local HUD_H = 30
 
 local CFG = { BASE_URL = "", VOLUME = 1.0, TEXT_SCALE = 0.5, AUTO_ZOOM = true, AUDIO_OFFSET = 0, AUDIO_LAG_MS = 300 }
 
---------------------------------------------------------------------------
--- tiny helpers
---------------------------------------------------------------------------
 
 local sleep = os.sleep
 
@@ -71,9 +48,6 @@ local function fmtTime(sec)
     return string.format("%d:%02d", m, s)
 end
 
---------------------------------------------------------------------------
--- config
---------------------------------------------------------------------------
 
 local function loadCfg()
     if fs.exists(CFG_PATH) then
@@ -118,9 +92,6 @@ local function promptUrl()
     return true
 end
 
---------------------------------------------------------------------------
--- http
---------------------------------------------------------------------------
 
 local function httpGetText(url)
     local r = http.get(url, nil, true)
@@ -131,8 +102,6 @@ local function httpGetText(url)
     return s
 end
 
--- some CC:Graphics builds reject string pixel rows and only accept tables of
--- numbers. probe once, then route every row blit through these helpers.
 local ROW_STRINGS = true
 
 local function probePixelFormat()
@@ -150,7 +119,6 @@ local function drawRow(x, y, s)
     if ROW_STRINGS then
         term.drawPixels(x, y, s)
     else
-        -- this build wants a list of rows; each row is a list of palette ids
         term.drawPixels(x, y, { { s:byte(1, #s) } })
     end
 end
@@ -165,9 +133,6 @@ local function drawRows(x, y, rows)
     end
 end
 
---------------------------------------------------------------------------
--- 3x5 pixel font
---------------------------------------------------------------------------
 
 local FONT_SRC = {
     ["0"]="###|#.#|#.#|#.#|###", ["1"]=".#.|##.|.#.|.#.|###",
@@ -211,17 +176,16 @@ for ch, def in pairs(FONT_SRC) do
     FONT[ch] = rows
 end
 
-local function textWidth(s, scale) return #s * 4 * scale - scale end
+local function textWidth(s, scale) return #s * 5 * scale end
 
 local function fitText(s, maxPx, scale)
     if textWidth(s, scale) <= maxPx then return s end
-    local n = math.floor((maxPx + scale) / (4 * scale)) - 1
+    local n = math.floor(maxPx / (5 * scale)) - 1
     if n < 1 then n = 1 end
     if n >= #s then return s end
     return s:sub(1, n) .. "~"
 end
 
--- draws text with a solid baked background (fast path)
 local function drawText(x, y, s, fg, bg, scale)
     scale = scale or 1
     for r = 0, 4 do
@@ -233,6 +197,7 @@ local function drawText(x, y, s, fg, bg, scale)
                 local b = gr:sub(cx, cx) == "#" and fg or bg
                 seg[#seg + 1] = string.rep(string.char(b), scale)
             end
+            seg[#seg + 1] = string.rep(string.char(bg), 2 * scale)
         end
         local rowStr = table.concat(seg)
         for v = 0, scale - 1 do
@@ -242,9 +207,6 @@ local function drawText(x, y, s, fg, bg, scale)
     return textWidth(s, scale)
 end
 
---------------------------------------------------------------------------
--- screen helpers
---------------------------------------------------------------------------
 
 local SW, SH = 0, 0
 
@@ -291,9 +253,6 @@ local function drawSpinner(cx, cy, label)
     end
 end
 
---------------------------------------------------------------------------
--- frame scaling
---------------------------------------------------------------------------
 
 local REPMAP = {}
 
@@ -347,9 +306,6 @@ local function makeFrame(S, data)
     return rows
 end
 
---------------------------------------------------------------------------
--- shared player state + streaming downloader
---------------------------------------------------------------------------
 
 local function newState(base, name, parts, fps, dur, metaW, metaH,
                         sepAudio, pcmAudio)
@@ -416,9 +372,6 @@ local function initDims(S, size)
     end
     S.vw = bestW
     S.vh = size / bestW
-    -- maximise screen usage: integer nearest-neighbour zoom with centre
-    -- crop when upscaling, fractional step-down when source is bigger.
-    -- video never renders under the HUD bar, so scale to the area above it
     local vh2 = SH - HUD_H
     local f = math.min(SW / S.vw, vh2 / S.vh)
     local geo
@@ -537,8 +490,6 @@ local function openPart(S, p, retries)
     return false
 end
 
--- reopen `part`, rewind counters to its start and fast-scan forward to
--- where we were (or to a seek target). no payloads are kept while scanning.
 local function recover(S, savedF, savedA, part)
     for attempt = 1, 6 do
         if S.stop or S.seekReq then return false end
@@ -585,7 +536,6 @@ local function doSeek(S, t)
     local p = 0
     local resumeF, resumeA
     if S.sepAudio then
-        -- video-only parts: count frames; audio is streamed separately
         local targetF = math.max(0, math.floor(t * S.fps))
         for i = S.parts - 1, 0, -1 do
             local sf = S.partStartFrame[i]
@@ -649,7 +599,6 @@ local function downloader(S)
                         closeResp(S)
                         if not S.eof and not S.stop then
                             if not recover(S, S.frameNo, S.audioNo, S.partNo) then
-                                -- keep err; user can press R after fixing
                             end
                         end
                     end
@@ -662,9 +611,6 @@ local function downloader(S)
     closeResp(S)
 end
 
---------------------------------------------------------------------------
--- hud layout (shared by renderer + touch hit-testing)
---------------------------------------------------------------------------
 
 local function hudRects()
     local y0 = SH - HUD_H
@@ -683,9 +629,6 @@ local function insideRect(px, py, rct)
        and py >= rct[2] and py <= rct[2] + rct[4]
 end
 
---------------------------------------------------------------------------
--- separate-audio streamer (NAME.audio.dfpwm, new-style encodes)
---------------------------------------------------------------------------
 
 local function audioURL(S)
     local e = urlenc(S.name)
@@ -694,7 +637,7 @@ end
 
 local function audioStreamer(S)
     local resp = nil
-    local apos = 0            -- bytes consumed from the file
+    local apos = 0
     local function close()
         if resp then pcall(function() resp.close() end) end
         resp = nil
@@ -732,7 +675,6 @@ local function audioStreamer(S)
                 local c = resp.read(16384)
                 if not c then
                     close()
-                    -- park until a seek asks us to re-stream or playback ends
                     while not S.stop and not S.audioSeekByte do sleep(0.2) end
                 else
                     if discarding then
@@ -758,9 +700,6 @@ local function audioStreamer(S)
     close()
 end
 
---------------------------------------------------------------------------
--- player screen
---------------------------------------------------------------------------
 
 local audioDecoder = nil
 pcall(function()
@@ -769,7 +708,6 @@ pcall(function()
         audioDecoder = lib.make_decoder()
     end
 end)
--- 0 = try raw dfpwm strings first, 1 = decode to amplitude tables, 2 = no audio
 local SPK_MODE = 0
 
 local function spkStop(spk)
@@ -827,15 +765,9 @@ local function player(spk, movie)
         end
         if C.paused or C.finished or C.muted or S.seeking then return end
         if SPK_MODE >= 2 then return end
-        -- A/V sync: audio runs behind the video clock by AUDIO_LAG_MS
-        -- (video leads audio) plus the user's fine-tune offset
         local target = (now() - C.t0) + (CFG.AUDIO_OFFSET or 0) / 1000
             - (CFG.AUDIO_LAG_MS or 300) / 1000
 
-        -- old builds never raise speaker_audio_empty, so wall-clock pending
-        -- estimates lie about how much has drained. if no drain event has
-        -- shown up after a few pieces, switch to small pieces paced purely
-        -- by the video clock (the sync gate below makes overshoot impossible)
         if not C.sawEmpty and not C.legacyPacing then
             C.feedOk = (C.feedOk or 0) + 1
             if C.feedOk >= 15 then C.legacyPacing = true end
@@ -862,7 +794,6 @@ local function player(spk, movie)
             local piece = table.concat(taken)
             local payload = piece
             if S.pcmAudio then
-                -- already uncompressed amplitudes: just sign-convert bytes
                 payload = {}
                 for i = 1, #piece do
                     local b2 = piece:byte(i)
@@ -904,7 +835,6 @@ local function player(spk, movie)
             elseif SPK_MODE < 2 then
                 local callOk, callErr = pcall(spk.playAudio, payload, C.vol)
                 if not callOk then
-                    -- some builds dislike the volume argument
                     callOk = pcall(spk.playAudio, payload)
                 end
                 if callOk then
@@ -913,7 +843,6 @@ local function player(spk, movie)
                 elseif SPK_MODE == 0 and audioDecoder then
                     SPK_MODE = 1
                 elseif SPK_MODE == 1 then
-                    -- one more shot at mode 1 before declaring audio dead
                     local retryOk = pcall(spk.playAudio, payload)
                     if retryOk then
                         ok = true
@@ -1187,7 +1116,6 @@ local function player(spk, movie)
         elseif ev == "monitor_touch" then
             local cx = tonumber(p2) or 0
             local cy = tonumber(p3) or 0
-            -- different builds report char or pixel coords: test both mappings
             local pts = {
                 { cx * 6 - 3, cy * 9 - 4 },
                 { cx * 6 + 3, cy * 9 + 4 },
@@ -1265,9 +1193,6 @@ local function player(spk, movie)
     return C.terminated == true
 end
 
---------------------------------------------------------------------------
--- movie list / meta
---------------------------------------------------------------------------
 
 local function fetchList()
     local txt, err = httpGetText(CFG.BASE_URL .. "/movies.txt")
@@ -1305,9 +1230,6 @@ local function fetchMeta(name)
     }
 end
 
---------------------------------------------------------------------------
--- description / thumbnail extras
---------------------------------------------------------------------------
 
 local function fetchExtras(name)
     local e = urlenc(name)
@@ -1363,9 +1285,6 @@ local function wrapText(s, maxChars)
     return out
 end
 
---------------------------------------------------------------------------
--- menu screen
---------------------------------------------------------------------------
 
 local ITEM_H = 46
 
@@ -1481,16 +1400,15 @@ local function menuScreen()
     local function infoScreen(item, m, desc, thumb)
         local lines = {}
         if desc and #desc > 0 then
-            lines = wrapText(desc:upper(), math.floor((SW - 60) / 4))
+            lines = wrapText(desc:upper(), math.floor((SW - 48) / 10))
         end
         local view = 0
 
-        -- prepare scaled thumbnail rows once
         local trows, tw2, th2
         if thumb then
             tw2, th2 = thumb.w, thumb.h
-            local z = math.max(1, math.floor(math.min((SW - 80) / tw2,
-                120 / th2)))
+            local z = math.max(1, math.floor(math.min((SW - 100) / tw2,
+                84 / th2)))
             tw2, th2 = tw2 * z, th2 * z
             trows = {}
             for y = 1, thumb.h do
@@ -1503,38 +1421,41 @@ local function menuScreen()
 
         local irender = function()
             fill(0, 0, SW, SH, BG)
-            drawText(10, 6, fitText(item.name:upper(), SW - 20, 2),
+            drawText(12, 6, fitText(item.name:upper(), SW - 24, 2),
                 WHITE, BG, 2)
-            drawText(10, 20, fmtTime(m.fps and item.dur or item.dur or 0)
-                .. "   " .. tostring(m.parts) .. " PARTS",
+            drawText(12, 22, fmtTime(item.dur or 0) .. "   "
+                .. tostring(m.parts) .. " PARTS   " .. tostring(m.fps) .. " FPS",
                 GREY, BG, 1)
-            fill(0, 30, SW, 1, PANEL2)
+            fill(0, 32, SW, 1, PANEL2)
 
-            local ty = 38
+            local ty = 40
             if trows then
-                fill(8, ty - 2, tw2 + 4, th2 + 4, PANEL)
-                term.drawPixels(10, ty, trows)
-                ty = ty + th2 + 12
+                fill(10, ty - 3, tw2 + 6, th2 + 6, PANEL)
+                term.drawPixels(13, ty, trows)
+                ty = ty + th2 + 16
             end
-            local availH = SH - 34 - ty
-            local maxVis = math.max(1, math.floor(availH / 7))
+            local availH = SH - 42 - ty
+            local maxVis = math.max(1, math.floor(availH / 14))
             view = clamp(view, 0, math.max(0, #lines - maxVis))
             for i = 1, maxVis do
                 local ln = lines[view + i]
                 if not ln then break end
-                drawText(10, ty + (i - 1) * 7 - 1, ln, LIGHT, BG, 1)
+                drawText(12, ty + (i - 1) * 14, fitText(ln, SW - 44, 2),
+                    LIGHT, BG, 2)
             end
             if #lines > maxVis then
-                local barH = math.max(10, math.floor(availH *
+                local barH = math.max(12, math.floor(availH *
                     maxVis / #lines))
                 local barY = ty + math.floor((availH - barH) *
                     (view / math.max(1, #lines - maxVis)))
-                fill(SW - 8, ty, 4, availH, PANEL)
-                fill(SW - 8, barY, 4, barH, ACCENT)
+                fill(SW - 10, ty, 5, availH, PANEL)
+                fill(SW - 10, barY, 5, barH, ACCENT)
             end
-            fill(0, SH - 26, SW, 26, PANEL)
-            centerText(SH - 18, "ENTER PLAY      UP/DOWN SCROLL      ESC BACK",
-                GREY, PANEL, 1)
+            fill(0, SH - 30, SW, 30, PANEL)
+            fill(0, SH - 30, SW, 1, PANEL2)
+            centerText(SH - 15,
+                fitText("ENTER PLAY     UP/DOWN SCROLL     ESC BACK",
+                    SW - 20, 2), GREY, PANEL, 2)
         end
 
         irender()
@@ -1667,9 +1588,6 @@ local function menuScreen()
     end
 end
 
---------------------------------------------------------------------------
--- main
---------------------------------------------------------------------------
 
 local function findMonitor()
     local best = nil
