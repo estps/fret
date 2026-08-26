@@ -1,33 +1,13 @@
-------------------------------------------------------------------------------
--- CC CINEMA - cloud video player for CC:Tweaked + CC:Graphics
---
--- Plays movies produced by prepare.py (render mode 3 = GFX pixel stream).
---
--- SERVER SETUP (on your PC, inside the movie folder):
---   python3 -m http.server 8080
---   cloudflared tunnel --url http://localhost:8080
---   copy the https://xxxx.trycloudflare.com URL it prints
---
--- IN GAME:
---   cinema        first run asks for the tunnel URL (saved to /cinema.cfg)
---
--- CONTROLS:
---   menu : UP/DOWN select | ENTER play | U url | R refresh | ESC quit
---   play : SPACE pause | LEFT/RIGHT +-10s | UP/DOWN volume | M mute | Q quit
---   touch: left third -10s | middle pause | right third +10s
---          progress bar scrubs | bottom-right corner stops
-------------------------------------------------------------------------------
 
 local CFG_PATH = "/cinema.cfg"
 
-local CHUNK           = 65000     -- must match prepare.py
-local AUDIO_REC_SEC   = 0.25      -- one type-4 record = 0.25 s
-local VIDEO_CAP       = 1400000   -- ram budget: buffered video frames
-local AUDIO_CAP       = 720000    -- ram budget: buffered audio (~2 min)
-local SPK_PENDING_MAX = 64000     -- bytes queued in the speaker at once
+local CHUNK           = 65000
+local AUDIO_REC_SEC   = 0.25
+local VIDEO_CAP       = 1400000
+local AUDIO_CAP       = 720000
+local SPK_PENDING_MAX = 64000
 local READ_BLOCK      = 32768
 
--- ui palette slots (video uses 0..215, the 6x6x6 cube)
 local BG      = 240
 local PANEL   = 241
 local PANEL2  = 242
@@ -42,9 +22,6 @@ local BLACK   = 0
 
 local CFG = { BASE_URL = "", VOLUME = 1.0, TEXT_SCALE = 0.5, AUTO_ZOOM = true }
 
---------------------------------------------------------------------------
--- tiny helpers
---------------------------------------------------------------------------
 
 local sleep = os.sleep
 
@@ -69,9 +46,6 @@ local function fmtTime(sec)
     return string.format("%d:%02d", m, s)
 end
 
---------------------------------------------------------------------------
--- config
---------------------------------------------------------------------------
 
 local function loadCfg()
     if fs.exists(CFG_PATH) then
@@ -116,9 +90,6 @@ local function promptUrl()
     return true
 end
 
---------------------------------------------------------------------------
--- http
---------------------------------------------------------------------------
 
 local function httpGetText(url)
     local r = http.get(url, nil, true)
@@ -129,8 +100,6 @@ local function httpGetText(url)
     return s
 end
 
--- some CC:Graphics builds reject string pixel rows and only accept tables of
--- numbers. probe once, then route every row blit through these helpers.
 local ROW_STRINGS = true
 
 local function probePixelFormat()
@@ -148,7 +117,6 @@ local function drawRow(x, y, s)
     if ROW_STRINGS then
         term.drawPixels(x, y, s)
     else
-        -- this build wants a list of rows; each row is a list of palette ids
         term.drawPixels(x, y, { { s:byte(1, #s) } })
     end
 end
@@ -163,9 +131,6 @@ local function drawRows(x, y, rows)
     end
 end
 
---------------------------------------------------------------------------
--- 3x5 pixel font
---------------------------------------------------------------------------
 
 local FONT_SRC = {
     ["0"]="###|#.#|#.#|#.#|###", ["1"]=".#.|##.|.#.|.#.|###",
@@ -219,7 +184,6 @@ local function fitText(s, maxPx, scale)
     return s:sub(1, n) .. "~"
 end
 
--- draws text with a solid baked background (fast path)
 local function drawText(x, y, s, fg, bg, scale)
     scale = scale or 1
     for r = 0, 4 do
@@ -240,9 +204,6 @@ local function drawText(x, y, s, fg, bg, scale)
     return textWidth(s, scale)
 end
 
---------------------------------------------------------------------------
--- screen helpers
---------------------------------------------------------------------------
 
 local SW, SH = 0, 0
 
@@ -289,9 +250,6 @@ local function drawSpinner(cx, cy, label)
     end
 end
 
---------------------------------------------------------------------------
--- frame scaling
---------------------------------------------------------------------------
 
 local REPMAP = {}
 
@@ -333,9 +291,6 @@ local function makeFrame(S, data)
     return rows
 end
 
---------------------------------------------------------------------------
--- shared player state + streaming downloader
---------------------------------------------------------------------------
 
 local function newState(base, name, parts, fps, dur, metaW, metaH)
     return {
@@ -503,8 +458,6 @@ local function openPart(S, p, retries)
     return false
 end
 
--- reopen `part`, rewind counters to its start and fast-scan forward to
--- where we were (or to a seek target). no payloads are kept while scanning.
 local function recover(S, savedF, savedA, part)
     for attempt = 1, 6 do
         if S.stop or S.seekReq then return false end
@@ -599,7 +552,6 @@ local function downloader(S)
                         closeResp(S)
                         if not S.eof and not S.stop then
                             if not recover(S, S.frameNo, S.audioNo, S.partNo) then
-                                -- keep err; user can press R after fixing
                             end
                         end
                     end
@@ -612,9 +564,6 @@ local function downloader(S)
     closeResp(S)
 end
 
---------------------------------------------------------------------------
--- player screen
---------------------------------------------------------------------------
 
 local audioDecoder = nil
 pcall(function()
@@ -623,7 +572,6 @@ pcall(function()
         audioDecoder = lib.make_decoder()
     end
 end)
--- 0 = try raw dfpwm strings first, 1 = decode to amplitude tables, 2 = no audio
 local SPK_MODE = 0
 
 local function spkStop(spk)
@@ -681,11 +629,19 @@ local function player(spk, movie)
                 if not audioDecoder then SPK_MODE = 2 end
             end
             if SPK_MODE == 1 and audioDecoder then
-                local pcm = audioDecoder(piece)
-                payload = {}
-                for i = 1, #pcm do
-                    local b = pcm:byte(i)
-                    payload[i] = b < 128 and b or b - 256
+                local decOk, pcm = pcall(audioDecoder, piece)
+                if not decOk or pcm == nil then
+                    SPK_MODE = 2
+                elseif type(pcm) == "string" then
+                    payload = {}
+                    for i = 1, #pcm do
+                        local b = pcm:byte(i)
+                        payload[i] = b < 128 and b or b - 256
+                    end
+                elseif type(pcm) == "table" then
+                    payload = pcm
+                else
+                    SPK_MODE = 2
                 end
             end
             local ok = false
@@ -930,9 +886,6 @@ local function player(spk, movie)
     return C.terminated == true
 end
 
---------------------------------------------------------------------------
--- movie list / meta
---------------------------------------------------------------------------
 
 local function fetchList()
     local txt, err = httpGetText(CFG.BASE_URL .. "/movies.txt")
@@ -968,9 +921,6 @@ local function fetchMeta(name)
     }
 end
 
---------------------------------------------------------------------------
--- menu screen
---------------------------------------------------------------------------
 
 local ITEM_H = 46
 
@@ -1170,9 +1120,6 @@ local function menuScreen()
     end
 end
 
---------------------------------------------------------------------------
--- main
---------------------------------------------------------------------------
 
 local function findMonitor()
     local best = nil
