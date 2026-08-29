@@ -1,1987 +1,1612 @@
 
+local CFG_PATH = "/cinema.cfg"
 
-local BASE = "https://relates-exclude-legend-strand.trycloudflare.com"
+local CHUNK           = 65000
+local AUDIO_REC_SEC   = 0.25
+local VIDEO_CAP       = 1400000
+local AUDIO_CAP       = 720000
+local SPK_PENDING_MAX = 64000
+local READ_BLOCK      = 32768
 
-local PART_LOW = 4000000
-local PREFILL = 5500000
-local MAX_BUF = 8000000
-local PLAY_AHEAD = 7500000
-local IDLE_SAVER = 75
+local BG      = 240
+local PANEL   = 241
+local PANEL2  = 242
+local GREY    = 243
+local LIGHT   = 244
+local WHITE   = 245
+local ACCENT  = 246
+local ACCENT2 = 247
+local RED     = 248
+local DEEP    = 250
+local BLACK   = 0
 
-local SETTINGS_FILE = ".cctv_settings"
-local DELAY_MS = 0
-local VOL = 1.0
-local SFX = true
-if fs.exists(SETTINGS_FILE) then
-    local f = fs.open(SETTINGS_FILE, "r")
-    local first = f.readLine() or ""
-    if first:find("=") then
-        f.seek("set", 0)
-        while true do
-            local ln = f.readLine()
-            if not ln then break end
-            local k, v = ln:match("^(%w+)=(.+)$")
-            if k == "delay" then DELAY_MS = tonumber(v) or 0 end
-            if k == "vol" then VOL = math.min(3, math.max(0, tonumber(v) or 1)) end
-            if k == "sfx" then SFX = v == "1" end
-        end
-    else
-        DELAY_MS = tonumber(first) or 0
-    end
-    f.close()
+
+local CFG = { BASE_URL = "", VOLUME = 1.0, TEXT_SCALE = 0.5, AUTO_ZOOM = true, AUDIO_OFFSET = 0, AUDIO_LAG_MS = 300 }
+
+
+local sleep = os.sleep
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo elseif v > hi then return hi else return v end
 end
-local function saveSettings()
-    local f = fs.open(SETTINGS_FILE, "w")
-    f.write(("delay=%d\nvol=%.2f\nsfx=%d\n"):format(DELAY_MS, VOL, SFX and 1 or 0))
-    f.close()
-end
+local function round(v) return math.floor(v + 0.5) end
+local function now() return os.epoch("utc") / 1000 end
 
-local function urlencode(s)
-    return s:gsub("[^%w%-_%.~]", function(c)
-        return ("%%%02X"):format(string.byte(c))
-    end)
+local function urlenc(s)
+    return (s:gsub("[^%w%-%_%.%~]", function(c)
+        return string.format("%%%02X", c:byte())
+    end))
 end
 
-local mon = peripheral.find("monitor")
-if not mon then error("No monitor attached", 0) end
-mon.setTextScale(0.5)
-
-local GFX = (mon.setGraphicsMode ~= nil)
-
-local sp = peripheral.find("speaker")
-
--- Buffer storage: the computer's own root plus every mounted floppy/drive
--- reachable on the network. Parts are striped across all of them round-robin.
-local DISKS = { "" }
-for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == "drive" then
-        local drv = peripheral.wrap(name)
-        local ok, mp = pcall(function() return drv.getMountPath() end)
-        if ok and type(mp) == "string" and #mp > 0 and fs.isDir(mp) then
-            DISKS[#DISKS + 1] = mp
-        end
-    end
-end
-
-local function totalFree()
-    local t = 0
-    for _, d in ipairs(DISKS) do t = t + fs.getFreeSpace(d) end
-    return t
-end
-
-local function sweepBuffers()
-    -- remove buffered parts from every disk (startup hygiene / end of play)
-    for _, d in ipairs(DISKS) do
-        for _, f in ipairs(fs.list(d)) do
-            if f:match("%.ccm%.%d+$") or f:match("%.ccm%.%d+%.part$") then
-                fs.delete(fs.combine(d, f))
-            end
-        end
-    end
-end
-
-print(("Buffer storage: %d disk(s), %.1f MB free")
-    :format(#DISKS, totalFree() / 1000000))
-
--- throttled debug log for the PC terminal: repeats of the same message are
--- suppressed for 2s so the console stays readable
-local lastDbgMsg, lastDbgT = "", 0
-local function dbg(msg)
-    local now = os.clock()
-    if msg == lastDbgMsg and now - lastDbgT < 2 then return end
-    lastDbgMsg, lastDbgT = msg, now
-    print("[dbg] " .. msg)
-end
-
-local savedPal = {}
-for i = 0, 15 do
-    local ok, c1, c2, c3 = pcall(mon.getPaletteColour, 2 ^ i)
-    if ok then savedPal[i + 1] = { c1, c2, c3 } end
-end
-local function resetPalette()
-    for i = 0, 15 do
-        if savedPal[i + 1] then
-            pcall(mon.setPaletteColour, 2 ^ i, unpack(savedPal[i + 1]))
-        end
-    end
-end
-
-local THEME = {
-    { colours.grey,      22, 24, 29 },
-    { colours.lightGrey, 54, 58, 68 },
-    { colours.blue,      30, 42, 78 },
-    { colours.lightBlue, 146, 158, 176 },
-    { colours.lime,      96, 218, 108 },
-    { colours.cyan,      62, 198, 216 },
-    { colours.yellow,    255, 194, 64 },
-    { colours.orange,    255, 138, 44 },
-    { colours.purple,    128, 98, 232 },
-    { colours.red,       236, 66, 56 },
-    { colours.green,     60, 160, 70 },
-    { colours.magenta,   214, 80, 200 },
-    { colours.pink,      235, 120, 170 },
-    { colours.brown,     130, 90, 55 },
-    { colours.white,     236, 238, 242 },
-    { colours.black,     5, 6, 9 },
-}
-local function applyTheme()
-    for _, t in ipairs(THEME) do
-        pcall(mon.setPaletteColour, t[1], t[2] / 255, t[3] / 255, t[4] / 255)
-    end
-end
-resetPalette()
-applyTheme()
-
-local MW, MH = mon.getSize()
-
-local function clockStr()
-    local ok, s = pcall(textutils.formatTime, os.time(), false)
-    if ok and s then return s end
-    return ""
-end
-
-local function parseMovieLines(body)
-    local found = {}
-    for line in body:gmatch("[^\r\n]+") do
-        local lab, dur = line:match("^(.-)%s+(%-?%d+%.?%d*)$")
-        if lab and #lab > 0 then
-            found[#found + 1] = { label = lab, dur = tonumber(dur) }
-        elseif #line > 0 then
-            found[#found + 1] = { label = line }
-        end
-    end
-    return found
-end
-
-local function fetchMovies()
-    local found, ok = {}, false
-    local res = http.get(BASE .. "/movies.txt", nil, true)
-    if res then
-        ok = true
-        local body = res.readAll()
-        res.close()
-        found = parseMovieLines(body)
-    end
-    if #found == 0 then
-        for _, f in ipairs(fs.list("")) do
-            local n = f:match("^(.+)%.meta$")
-            if n and #n > 0 then found[#found + 1] = { label = n } end
-        end
-    end
-    return found, ok
-end
-
-local SEEN_FILE = ".cctv_seen"
-local seen = {}
-if fs.exists(SEEN_FILE) then
-    local f = fs.open(SEEN_FILE, "r")
-    while true do
-        local ln = f.readLine()
-        if not ln then break end
-        seen[ln] = true
-    end
-    f.close()
-end
-local function markSeen(name)
-    seen[name] = true
-    local f = fs.open(SEEN_FILE, "w")
-    for k in pairs(seen) do f.write(k .. "\n") end
-    f.close()
-end
-
-local function chip(x, y, s, bg, fg)
-    mon.setBackgroundColour(bg)
-    mon.setTextColour(fg)
-    mon.setCursorPos(x, y)
-    mon.write(s)
-end
-
-local function segments(y, x0, parts, bg)
-    mon.setBackgroundColour(bg or colours.black)
-    local x = x0
-    for _, p in ipairs(parts) do
-        if x > MW then break end
-        local t = p.t
-        if x + #t - 1 > MW then t = t:sub(1, MW - x + 1) end
-        mon.setTextColour(p.c)
-        mon.setCursorPos(x, y)
-        mon.write(t)
-        x = x + #t
-    end
-end
-
-local function centre(y, s, c)
-    mon.setTextColour(c)
-    mon.setBackgroundColour(colours.black)
-    mon.setCursorPos(math.max(1, math.floor((MW - #s) / 2) + 1), y)
-    mon.write(s)
-end
-
-local function box(x0, y0, w, h, borderColour)
-    mon.setTextColour(borderColour or colours.lightGrey)
-    mon.setBackgroundColour(colours.black)
-    mon.setCursorPos(x0, y0)
-    mon.write("+" .. string.rep("-", w - 2) .. "+")
-    for r = 1, h - 2 do
-        mon.setCursorPos(x0, y0 + r)
-        mon.write("|" .. string.rep(" ", w - 2) .. "|")
-    end
-    mon.setCursorPos(x0, y0 + h - 1)
-    mon.write("+" .. string.rep("-", w - 2) .. "+")
-end
-
-local GLYPH = {
-    C = { " ### ", "#   #", "#    ", "#   #", " ### " },
-    T = { "#####", "  #  ", "  #  ", "  #  ", "  #  " },
-    V = { "#   #", "#   #", "#   #", " # # ", "  #  " },
-    P = { "#### ", "#   #", "#### ", "#    ", "#    " },
-    A = { " ### ", "#   #", "#####", "#   #", "#   #" },
-    U = { "#   #", "#   #", "#   #", "#   #", " ### " },
-    S = { " ####", "#    ", " ### ", "    #", "#### " },
-    E = { "#####", "#    ", "###  ", "#    ", "#####" },
-    D = { "#### ", "#   #", "#   #", "#   #", "#### " },
-    B = { "#### ", "#   #", "#### ", "#   #", "#### " },
-    F = { "#####", "#    ", "#### ", "#    ", "#    " },
-    G = { " ### ", "#    ", "#  ##", "#   #", " ### " },
-    H = { "#   #", "#   #", "#####", "#   #", "#   #" },
-    I = { "#####", "  #  ", "  #  ", "  #  ", "#####" },
-    J = { "    #", "    #", "    #", "#   #", " ### " },
-    K = { "#   #", "#  # ", "###  ", "#  # ", "#   #" },
-    L = { "#    ", "#    ", "#    ", "#    ", "#####" },
-    M = { "#   #", "## ##", "# # #", "#   #", "#   #" },
-    N = { "#   #", "##  #", "# # #", "#  ##", "#   #" },
-    O = { " ### ", "#   #", "#   #", "#   #", " ### " },
-    Q = { " ### ", "#   #", "# # #", "#  # ", " ## #" },
-    R = { "#### ", "#   #", "#### ", "#  # ", "#   #" },
-    W = { "#   #", "#   #", "# # #", "## ##", "#   #" },
-    X = { "#   #", " # # ", "  #  ", " # # ", "#   #" },
-    Y = { "#   #", "#   #", " ### ", "  #  ", "  #  " },
-    Z = { "#####", "   # ", "  #  ", " #   ", "#####" },
-}
-
-local function drawGlyph(ch, x, y, c)
-    local g = GLYPH[ch]
-    if not g then return end
-    mon.setBackgroundColour(c)
-    for r = 1, 5 do
-        for i = 1, 5 do
-            if g[r]:sub(i, i) == "#" then
-                mon.setCursorPos(x + i - 1, y + r - 1)
-                mon.write(" ")
-            end
-        end
-    end
-    mon.setBackgroundColour(colours.black)
-end
-
-local function wordWidth(w) return #w * 6 - 1 end
-
-local function drawWord(w, x, y, c)
-    for i = 1, #w do
-        local ch = w:sub(i, i)
-        if ch ~= " " then drawGlyph(ch, x + (i - 1) * 6, y, c) end
-    end
-    mon.setBackgroundColour(colours.black)
-end
-
-local function drawLogo(x, y)
-    local cx = x
-    drawGlyph("C", cx, y, colours.lime); cx = cx + 6
-    drawGlyph("C", cx, y, colours.lime); cx = cx + 7
-    drawGlyph("T", cx, y, colours.cyan); cx = cx + 6
-    drawGlyph("V", cx, y, colours.cyan)
-    mon.setBackgroundColour(colours.black)
-end
-
-local function fmtDur(sec)
-    if not sec or sec <= 0 then return nil end
-    sec = math.floor(sec + 0.5)
+local function fmtTime(sec)
+    sec = math.max(0, math.floor(sec + 0.5))
     local h = math.floor(sec / 3600)
     local m = math.floor((sec % 3600) / 60)
-    if h > 0 then return ("%dh%02dm"):format(h, m) end
-    if m > 0 then return ("%dm"):format(m) end
-    return ("%ds"):format(sec)
+    local s = sec % 60
+    if h > 0 then return string.format("%d:%02d:%02d", h, m, s) end
+    return string.format("%d:%02d", m, s)
 end
 
-local function blip(kind)
-    if not SFX or not sp then return end
-    local v = math.min(1.5, 0.35 * VOL)
+
+local function loadCfg()
+    if fs.exists(CFG_PATH) then
+        local f = io.open(CFG_PATH, "r")
+        local data = f:read("*a")
+        f:close()
+        local t = textutils.unserialise(data)
+        if type(t) == "table" then
+            for k, v in pairs(t) do CFG[k] = v end
+        end
+    end
+end
+
+local function saveCfg()
+    local f = io.open(CFG_PATH, "w")
+    f:write(textutils.serialise(CFG))
+    f:close()
+end
+
+local function promptUrl()
+    term.setTextColor(colors.yellow)
+    print("CC CINEMA needs the URL of your video server.")
+    print("On your PC run:")
+    print("  python3 -m http.server 8080")
+    print("  cloudflared tunnel --url http://localhost:8080")
+    print()
+    term.setTextColor(colors.white)
+    write("Paste URL (https://xxxx.trycloudflare.com): ")
+    term.setCursorBlink(true)
+    local u = read()
+    term.setCursorBlink(false)
+    u = (u or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+    if not u:match("^https?://") then
+        term.setTextColor(colors.red)
+        print("That does not look like a URL.")
+        sleep(2)
+        return false
+    end
+    CFG.BASE_URL = u
+    saveCfg()
+    print("Saved to " .. CFG_PATH)
+    return true
+end
+
+
+local function httpGetText(url)
+    local r = http.get(url, nil, true)
+    if not r then return nil, "could not connect" end
+    local s = r.readAll()
+    r.close()
+    if not s then return nil, "empty response" end
+    return s
+end
+
+local ROW_STRINGS = true
+
+local function probePixelFormat()
+    local ok = pcall(term.drawPixels, 0, 0, "\1\1\1")
+    if not ok then
+        ROW_STRINGS = false
+        ok = pcall(term.drawPixels, 0, 0, { 1, 1, 1 })
+        if not ok then
+            error("CC:Graphics drawPixels accepts neither strings nor tables.", 0)
+        end
+    end
+end
+
+local function drawRow(x, y, s)
+    if ROW_STRINGS then
+        term.drawPixels(x, y, s)
+    else
+        term.drawPixels(x, y, { { s:byte(1, #s) } })
+    end
+end
+
+local function drawRows(x, y, rows)
+    if ROW_STRINGS then
+        term.drawPixels(x, y, rows)
+    else
+        local t = {}
+        for i = 1, #rows do t[i] = { rows[i]:byte(1, #rows[i]) } end
+        term.drawPixels(x, y, t)
+    end
+end
+
+
+local FONT_SRC = {
+    ["0"]="###|#.#|#.#|#.#|###", ["1"]=".#.|##.|.#.|.#.|###",
+    ["2"]="###|..#|###|#..|###", ["3"]="###|..#|###|..#|###",
+    ["4"]="#.#|#.#|###|..#|..#", ["5"]="###|#..|###|..#|###",
+    ["6"]="###|#..|###|#.#|###", ["7"]="###|..#|..#|..#|..#",
+    ["8"]="###|#.#|###|#.#|###", ["9"]="###|#.#|###|..#|###",
+    A="###|#.#|###|#.#|#.#", B="##.|#.#|##.|#.#|##.",
+    C="###|#..|#..|#..|###", D="##.|#.#|#.#|#.#|##.",
+    E="###|#..|###|#..|###", F="###|#..|###|#..|#..",
+    G="###|#..|#.#|#.#|###", H="#.#|#.#|###|#.#|#.#",
+    I="###|.#.|.#.|.#.|###", J="..#|..#|..#|#.#|###",
+    K="#.#|#.#|##.|#.#|#.#", L="#..|#..|#..|#..|###",
+    M="#.#|###|#.#|#.#|#.#", N="###|#.#|#.#|#.#|#.#",
+    O="###|#.#|#.#|#.#|###", P="###|#.#|###|#..|#..",
+    Q="###|#.#|###|..#|..#", R="###|#.#|##.|#.#|#.#",
+    S="###|#..|###|..#|###", T="###|.#.|.#.|.#.|.#.",
+    U="#.#|#.#|#.#|#.#|###", V="#.#|#.#|#.#|#.#|.#.",
+    W="#.#|#.#|#.#|###|#.#", X="#.#|#.#|.#.|#.#|#.#",
+    Y="#.#|#.#|###|.#.|.#.", Z="###|..#|.#.|#..|###",
+    [" "]="...|...|...|...|...",
+    [":"]="...|.#.|...|.#.|...", ["."]="_._|...|...|...|._.",
+    [","]="_._|...|...|._.|#..", ["-"]="_._|_._|###|_._|_._",
+    ["+"]="_._|.#.|###|.#.|_._", ["/"]="_._|..#|..#|.#.|#..",
+    ["%"]="#.#|..#|.#.|#..|#.#", ["("]=".#.|#..|#..|#..|.#.",
+    [")"]=".#.|..#|..#|..#|.#.", ["'"]="#..|#..|_._|_._|_._",
+    ["!"]=".#.|.#.|.#.|_._|.#.", ["?"]="###|..#|.#.|_._|.#.",
+    ["_"]="_._|_._|_._|_._|###", ["<"]="..#|.#.|#..|.#.|..#",
+    [">"]="#..|.#.|..#|.#.|#..", ["="]="_._|###|_._|###|_._",
+    ['"']="#.#|#.#|_._|_._|_._", ["*"]="_._|#.#|.#.|#.#|_._",
+    ["&"]="##.|#..|###|#.#|###", ["#"]="#.#|###|#.#|###|#.#",
+    ["^"]=".#.|#.#|_._|_._|_._", ["~"]="_._|#.#|.#.|_._|_._",
+}
+
+local FONT = {}
+for ch, def in pairs(FONT_SRC) do
+    local rows = {}
+    for r in def:gmatch("[^|]+") do
+        rows[#rows + 1] = r:gsub("_", ".")
+    end
+    FONT[ch] = rows
+end
+
+local function textWidth(s, scale) return #s * 5 * scale end
+
+local function fitText(s, maxPx, scale)
+    if textWidth(s, scale) <= maxPx then return s end
+    local n = math.floor(maxPx / (5 * scale)) - 1
+    if n < 1 then n = 1 end
+    if n >= #s then return s end
+    return s:sub(1, n) .. "~"
+end
+
+local function drawText(x, y, s, fg, bg, scale)
+    scale = scale or 1
+    for r = 0, 4 do
+        local seg = {}
+        for i = 1, #s do
+            local g = FONT[s:sub(i, i):upper()] or FONT["?"]
+            local gr = g[r + 1]
+            for cx = 1, 3 do
+                local b = gr:sub(cx, cx) == "#" and fg or bg
+                seg[#seg + 1] = string.rep(string.char(b), scale)
+            end
+            seg[#seg + 1] = string.rep(string.char(bg), 2 * scale)
+        end
+        local rowStr = table.concat(seg)
+        for v = 0, scale - 1 do
+            drawRow(x, y + r * scale + v, rowStr)
+        end
+    end
+    return textWidth(s, scale)
+end
+
+
+local SW, SH = 0, 0
+
+local function fill(x, y, w, h, c)
+    if x < 0 then w = w + x x = 0 end
+    if y < 0 then h = h + y y = 0 end
+    if x + w > SW then w = SW - x end
+    if y + h > SH then h = SH - y end
+    if w <= 0 or h <= 0 then return end
+    term.drawPixels(x, y, c, w, h)
+end
+
+local function setupPalette()
+    for i = 0, 215 do
+        term.setPaletteColor(i,
+            math.floor(i / 36) * 51 / 255,
+            (math.floor(i / 6) % 6) * 51 / 255,
+            (i % 6) * 51 / 255)
+    end
+    term.setPaletteColor(BG,      0.043, 0.043, 0.063)
+    term.setPaletteColor(PANEL,   0.098, 0.098, 0.125)
+    term.setPaletteColor(PANEL2,  0.180, 0.184, 0.220)
+    term.setPaletteColor(GREY,    0.470, 0.480, 0.520)
+    term.setPaletteColor(LIGHT,   0.700, 0.710, 0.750)
+    term.setPaletteColor(WHITE,   0.940, 0.945, 0.960)
+    term.setPaletteColor(ACCENT,  0.150, 0.780, 0.950)
+    term.setPaletteColor(ACCENT2, 1.000, 0.620, 0.180)
+    term.setPaletteColor(RED,     0.930, 0.290, 0.290)
+    term.setPaletteColor(DEEP,    0.020, 0.020, 0.031)
+end
+
+local function drawSpinner(cx, cy, label)
+    local t = math.floor(os.epoch("utc") / 130) % 8
+    fill(cx - 12, cy - 12, 25, 25, BG)
+    for i = 0, 7 do
+        local a = (i / 8) * 2 * math.pi - t * 0.785
+        local dx = round(cx + math.cos(a) * 7) - 1
+        local dy = round(cy + math.sin(a) * 7) - 1
+        fill(dx, dy, 2, 2, i == t and ACCENT or PANEL2)
+    end
+    if label then
+        local s = fitText(label, 260, 1)
+        drawText(round(cx - textWidth(s, 1) / 2), cy + 15, s, LIGHT, BG, 1)
+    end
+end
+
+
+local REPMAP = {}
+
+local function expandRow(row, z)
+    if z == 1 then return row end
+    local m = REPMAP[z]
+    if not m then
+        m = {}
+        for i = 0, 255 do m[string.char(i)] = string.char(i):rep(z) end
+        REPMAP[z] = m
+    end
+    return (row:gsub(".", m))
+end
+
+local function makeFrame(S, data)
+    local geo = S.geo
+    local vw = S.vw
+    local rows = {}
+    if geo.kind == "zoom" and geo.z >= 2 then
+        local z, x0, y0 = geo.z, geo.x0, geo.y0
+        local want = x0 + geo.w
+        local emitted, skip = 0, y0
+        for y = 1, S.vh do
+            if emitted >= geo.h then break end
+            local er = expandRow(data:sub((y - 1) * vw + 1, y * vw), z)
+            if #er > want then er = er:sub(x0 + 1, want) end
+            for k = 1, z do
+                if skip > 0 then
+                    skip = skip - 1
+                elseif emitted < geo.h then
+                    rows[#rows + 1] = er
+                    emitted = emitted + 1
+                end
+            end
+        end
+    elseif geo.kind == "down" then
+        local d = geo.ds
+        local half = math.ceil(d / 2)
+        for y = half, S.vh, d do
+            if #rows >= geo.h then break end
+            local sr = data:sub((y - 1) * vw + 1, y * vw)
+            local acc = {}
+            for x = half, vw, d do acc[#acc + 1] = sr:sub(x, x) end
+            rows[#rows + 1] = table.concat(acc)
+        end
+    else
+        for y = 1, S.vh do
+            rows[#rows + 1] = data:sub((y - 1) * vw + 1, y * vw)
+        end
+    end
+    return rows
+end
+
+
+local function newState(base, name, parts, fps, dur, metaW, metaH,
+                        sepAudio, pcmAudio)
+    return {
+        base = base, name = name, parts = parts, fps = fps, dur = dur,
+        sepAudio = sepAudio and true or false,
+        pcmAudio = pcmAudio and true or false,
+        metaW = metaW, metaH = metaH,
+        videoQ = {}, videoBytes = 0, audioQ = {}, audioBytes = 0,
+        partStartFrame = {}, partStartAudio = {},
+        partNo = 0, resp = nil, rbuf = "",
+        frameNo = 0, audioNo = 0,
+        curOpen = false, curParts = nil,
+        scanOnly = false, resumeF = nil, resumeA = nil,
+        seekReq = nil, seeking = false,
+        eof = false, err = nil, stop = false,
+        needRecover = nil,
+        vw = nil, vh = nil, geo = nil,
+    }
+end
+
+local function partURL(S, p)
+    local e = urlenc(S.name)
+    return S.base .. "/" .. e .. "/" .. e .. ".ccm." .. p
+end
+
+local function closeResp(S)
+    if S.resp then
+        pcall(function() S.resp.close() end)
+        S.resp = nil
+    end
+    S.rbuf = ""
+end
+
+local function readExact(S, n)
+    local buf = S.rbuf
+    while #buf < n do
+        if not S.resp then S.rbuf = buf return nil end
+        local need = n - #buf
+        local c = S.resp.read(math.min(READ_BLOCK, math.max(4096, need)))
+        if not c or c == "" then
+            S.rbuf = buf
+            return nil
+        end
+        buf = buf .. c
+    end
+    S.rbuf = buf:sub(n + 1)
+    return buf:sub(1, n)
+end
+
+local function initDims(S, size)
+    local ratio = 16 / 9
+    if S.metaW and S.metaH and S.metaW > 0 and S.metaH > 0 then
+        ratio = S.metaW / S.metaH
+    end
+    local bestW, bestDiff = math.floor(math.sqrt(size)), math.huge
+    for w = 1, math.floor(math.sqrt(size)) do
+        if size % w == 0 then
+            for _, cand in ipairs({ w, size / w }) do
+                local d = math.abs(cand / (size / cand) - ratio)
+                if d < bestDiff then bestDiff, bestW = d, cand end
+            end
+        end
+    end
+    S.vw = bestW
+    S.vh = size / bestW
+    local vh2 = SH
+    local f = math.min(SW / S.vw, vh2 / S.vh)
+    local geo
+    if f < 0.75 then
+        local ds = math.max(math.ceil(1 / f), 1)
+        local dw, dh = round(S.vw / ds), round(S.vh / ds)
+        geo = { kind = "down", ds = ds,
+                vx = math.floor((SW - dw) / 2), vy = math.floor((vh2 - dh) / 2),
+                w = dw, h = dh, z = 1 }
+    else
+        local z = 1
+        if CFG.AUTO_ZOOM ~= false then z = math.max(1, math.floor(f + 0.5)) end
+        local dw, dh = S.vw * z, S.vh * z
+        local x0 = math.floor((dw - SW) / 2)
+        if x0 < 0 then x0 = 0 end
+        local y0 = math.floor((dh - vh2) / 2)
+        if y0 < 0 then y0 = 0 end
+        local wv = math.min(dw - x0, SW)
+        local hv = math.min(dh - y0, vh2)
+        geo = { kind = "zoom", z = z,
+                x0 = x0, y0 = y0, w = wv, h = hv,
+                vx = math.floor((SW - wv) / 2),
+                vy = math.floor((vh2 - hv) / 2) }
+    end
+    geo.scaleLabel = (geo.kind == "zoom")
+        and (tostring(geo.z) .. "x" .. ((geo.x0 > 0 or geo.y0 > 0) and " crop" or ""))
+        or ("1/" .. tostring(geo.ds))
+    S.geo = geo
+end
+
+-- PackBits inverse: restores the exact vw*vh pixel string of a frame that
+-- prepare.py compressed (saves ~3-10x on the Cloudflare tunnel's bandwidth).
+local function unpackBits(s)
+    local out = {}
+    local i, n = 1, #s
+    while i <= n do
+        local c = s:byte(i)
+        i = i + 1
+        if c <= 127 then
+            local m = c + 1
+            out[#out + 1] = s:sub(i, i + m - 1)
+            i = i + m
+        elseif c >= 129 then
+            out[#out + 1] = s:sub(i, i):rep(257 - c)
+            i = i + 1
+        else
+            break -- c == 128 is never produced; defensive no-op
+        end
+    end
+    return table.concat(out)
+end
+
+local function completeFrame(S)
+    if not S.curOpen then return end
+    S.curOpen = false
+    local cp = S.curParts
+    S.curParts = nil
+    if S.scanOnly then
+        S.frameNo = S.frameNo + 1
+        return
+    end
+    local maxn = -1
+    for k in pairs(cp) do if k > maxn then maxn = k end end
+    local t = {}
+    for i = 0, maxn do t[#t + 1] = cp[i] or "" end
+    local data = unpackBits(table.concat(t))
+    if #data == 0 then return end
+    S.frameNo = S.frameNo + 1
+    if not S.vw then initDims(S, #data) end
+    if not S.vw or not S.geo then return end
+    local rows = makeFrame(S, data)
+    S.videoQ[#S.videoQ + 1] = { i = S.frameNo - 1, rows = rows, sz = #data }
+    S.videoBytes = S.videoBytes + #data
+end
+
+local function dispatch(S, typ, payload)
+    if typ == 4 then
+        S.audioNo = S.audioNo + 1
+        if not S.scanOnly then
+            S.audioQ[#S.audioQ + 1] = payload
+            S.audioBytes = S.audioBytes + #payload
+        end
+    elseif typ == 6 and #payload >= 1 then
+        local b = payload:byte(1)
+        local ci = b % 16
+        if ci == 0 and S.curOpen then completeFrame(S) end
+        if not S.curOpen then S.curOpen = true S.curParts = {} end
+        local dat = payload:sub(2)
+        S.curParts[ci] = dat
+        if #dat < CHUNK then completeFrame(S) end
+    end
+end
+
+local function catchUpCheck(S)
+    if not S.scanOnly then return end
+    local fOk = (S.resumeF == nil) or (S.frameNo >= S.resumeF)
+    local aOk = (S.resumeA == nil) or (S.audioNo >= S.resumeA)
+    if fOk and aOk then
+        S.scanOnly = false
+        S.resumeF = nil
+        S.resumeA = nil
+        S.seeking = false
+    end
+end
+
+local function endOfPart(S)
+    completeFrame(S)
+    closeResp(S)
+    if S.partNo + 1 >= S.parts then
+        S.eof = true
+        S.seeking = false
+    else
+        S.partNo = S.partNo + 1
+    end
+end
+
+local function openPart(S, p, retries)
+    for _ = 1, (retries or 5) do
+        if S.stop or S.seekReq or S.err then return false end
+        local r, e = http.get(partURL(S, p), nil, true)
+        if r then
+            S.resp = r
+            S.rbuf = ""
+            S.partNo = p
+            S.partStartFrame[p] = S.frameNo
+            S.partStartAudio[p] = S.audioNo
+            return true
+        end
+        local es = tostring(e)
+        if p > 0 and (es:find("404") or es:find("Not Found")) then
+            S.eof = true
+            S.seeking = false
+            return false
+        end
+        sleep(math.min(6, retries or 5))
+    end
+    S.err = "cannot reach server (is the tunnel up?)"
+    return false
+end
+
+local function recover(S, savedF, savedA, part)
+    for attempt = 1, 6 do
+        if S.stop or S.seekReq then return false end
+        sleep(math.min(10, attempt * 2))
+        local r = http.get(partURL(S, part), nil, true)
+        if r then
+            S.resp = r
+            S.rbuf = ""
+            S.partNo = part
+            S.frameNo = S.partStartFrame[part] or 0
+            S.audioNo = S.partStartAudio[part] or 0
+            S.curOpen = false
+            S.curParts = nil
+            S.scanOnly = true
+            S.resumeF = savedF
+            S.resumeA = savedA
+            return true
+        end
+    end
+    S.err = "lost connection to server"
+    return false
+end
+
+local function readOneRecord(S)
+    local hdr = readExact(S, 3)
+    if not hdr or #hdr < 3 then endOfPart(S) return end
+    local typ = hdr:byte(1)
+    local len = hdr:byte(2) * 256 + hdr:byte(3)
+    if len == 0 then return end
+    local payload = readExact(S, len)
+    if not payload or #payload < len then
+        completeFrame(S)
+        closeResp(S)
+        return "net"
+    end
+    dispatch(S, typ, payload)
+    catchUpCheck(S)
+end
+
+local function doSeek(S, t)
+    S.seeking = true
+    S.seekReq = nil
+    S.eof = false
+    local p = 0
+    local resumeF, resumeA
+    if S.sepAudio then
+        local targetF = math.max(0, math.floor(t * S.fps))
+        for i = S.parts - 1, 0, -1 do
+            local sf = S.partStartFrame[i]
+            if sf and sf <= targetF then p = i break end
+        end
+        if not S.partStartFrame[p] then
+            S.partStartFrame[p] = 0
+            S.partStartAudio[p] = 0
+        end
+        resumeF, resumeA = targetF, nil
+    else
+        local targetA = math.max(0, math.floor(t / AUDIO_REC_SEC) + 1)
+        for i = S.parts - 1, 0, -1 do
+            local sa = S.partStartAudio[i]
+            if sa and sa < targetA then p = i break end
+        end
+        if not S.partStartAudio[p] then
+            S.partStartAudio[p] = 0
+            S.partStartFrame[p] = 0
+        end
+        resumeF, resumeA = nil, targetA
+    end
+    closeResp(S)
+    S.curOpen = false
+    S.curParts = nil
+    S.frameNo = S.partStartFrame[p]
+    S.audioNo = S.partStartAudio[p]
+    S.scanOnly = true
+    S.resumeF = resumeF
+    S.resumeA = resumeA
+    if not openPart(S, p, 3) then
+        S.seeking = false
+    end
+end
+
+local function downloader(S)
+    while not S.stop do
+        if S.err then
+            sleep(0.3)
+        elseif S.needRecover then
+            local nr = S.needRecover
+            S.needRecover = nil
+            if not recover(S, nr.f, nr.a, nr.part) then
+                S.needRecover = nr
+                sleep(0.5)
+            end
+        elseif S.seekReq then
+            doSeek(S, S.seekReq)
+        else
+            while ((S.videoBytes >= VIDEO_CAP and #S.videoQ > 0)
+                or S.audioBytes >= AUDIO_CAP) do
+                if S.seekReq or S.stop or S.err or S.needRecover then break end
+                sleep(0.1)
+            end
+            if not S.seekReq and not S.stop and not S.err and not S.eof then
+                if not S.resp then
+                    openPart(S, S.partNo, 5)
+                else
+                    local ok, err = pcall(readOneRecord, S)
+                    if not ok or err == "net" then
+                        closeResp(S)
+                        if not S.eof and not S.stop then
+                            if not recover(S, S.frameNo, S.audioNo, S.partNo) then
+                            end
+                        end
+                    end
+                end
+            else
+                sleep(0.05)
+            end
+        end
+    end
+    closeResp(S)
+end
+
+
+local function audioURL(S)
+    local e = urlenc(S.name)
+    return S.base .. "/" .. e .. "/" .. e .. ".audio.dfpwm"
+end
+
+local function audioStreamer(S)
+    local resp = nil
+    local apos = 0
+    local function close()
+        if resp then pcall(function() resp.close() end) end
+        resp = nil
+        apos = 0
+    end
+    while not S.stop do
+        if S.audioSeekByte then
+            local target = S.audioSeekByte
+            S.audioSeekByte = nil
+            if target < apos then close() end
+            S.audioDiscardTo = target
+        end
+        local discarding = S.audioDiscardTo ~= nil and apos < S.audioDiscardTo
+        if not resp and not S.audioFileDead then
+            local opened = false
+            for attempt = 1, 5 do
+                if S.stop or S.audioSeekByte then break end
+                local r, e = http.get(audioURL(S), nil, true)
+                if r then resp = r opened = true break end
+                local es = tostring(e)
+                if es:find("404") or es:find("Not Found") then
+                    S.audioFileDead = true
+                    break
+                end
+                sleep(math.min(6, attempt))
+            end
+            if not opened and not resp then
+                if not S.audioFileDead then S.audioFileDead = true end
+            end
+        end
+        if resp then
+            if not discarding and S.audioBytes >= AUDIO_CAP then
+                sleep(0.1)
+            else
+                local c = resp.read(16384)
+                if not c then
+                    close()
+                    while not S.stop and not S.audioSeekByte do sleep(0.2) end
+                else
+                    if discarding then
+                        local before = S.audioDiscardTo - apos
+                        apos = apos + #c
+                        if #c > before then
+                            local keep = c:sub(before + 1)
+                            S.audioQ[#S.audioQ + 1] = keep
+                            S.audioBytes = S.audioBytes + #keep
+                            S.audioDiscardTo = nil
+                        end
+                    else
+                        apos = apos + #c
+                        S.audioQ[#S.audioQ + 1] = c
+                        S.audioBytes = S.audioBytes + #c
+                    end
+                end
+            end
+        else
+            sleep(0.2)
+        end
+    end
+    close()
+end
+
+
+local audioDecoder = nil
+pcall(function()
+    local lib = require("cc.audio.dfpwm")
+    if type(lib) == "table" and type(lib.make_decoder) == "function" then
+        audioDecoder = lib.make_decoder()
+    end
+end)
+local SPK_MODE = 0
+
+local function spkStop(spk)
+    if spk then pcall(function() spk.stop() end) end
+end
+
+local function player(spk, movie)
+    local S = newState(CFG.BASE_URL, movie.name, movie.parts, movie.fps,
+                       movie.dur, movie.metaW, movie.metaH,
+                       movie.sepAudio, movie.pcmAudio)
+    local C = {
+        pos = 0, t0 = now(), paused = false, muted = false,
+        vol = CFG.VOLUME or 1,
+        feedAmt = 0, feedMark = now(),
+        finished = false, seekPending = nil,
+        toast = nil, toastExp = 0,
+        audioSec = 0, dbg = false, audioDeadShown = false,
+    }
+
+    local ditherA, ditherB
+    local function buildDither(w)
+        local a, b = {}, {}
+        for i = 1, w do
+            a[i] = string.char(((i % 2) == 1) and DEEP or BLACK)
+            b[i] = string.char(((i % 2) == 1) and BLACK or DEEP)
+        end
+        ditherA = table.concat(a)
+        ditherB = table.concat(b)
+    end
+
+    local function toast(msg)
+        C.toast = msg
+        C.toastExp = now() + 1.2
+        C.hudNext = 0
+    end
+
+    local function apendingCalc()
+        return math.max(0, C.feedAmt - (now() - C.feedMark) * 6000)
+    end
+
+    local function feedAudio()
+        if not spk then
+            if not C.audioDeadShown then
+                C.audioDeadShown = true
+                C.muted = true
+                toast("NO SPEAKER ATTACHED")
+            end
+            return
+        end
+        if not C.spkVerified then
+            C.spkVerified = true
+            C.spkMethods = ""
+            for k2 in pairs(spk) do C.spkMethods = C.spkMethods .. tostring(k2) .. "," end
+        end
+        if C.paused or C.finished or C.muted or S.seeking then return end
+        if SPK_MODE >= 2 then return end
+        local target = (now() - C.t0) + (CFG.AUDIO_OFFSET or 0) / 1000
+            - (CFG.AUDIO_LAG_MS or 300) / 1000
+
+        if not C.sawEmpty and not C.legacyPacing then
+            C.feedOk = (C.feedOk or 0) + 1
+            if C.feedOk >= 15 then C.legacyPacing = true end
+        end
+        local legacy = C.legacyPacing
+        local capMax = ((SPK_MODE == 1 or S.pcmAudio) and
+            (legacy and 4000 or 16000)) or (legacy and 8000 or 32000)
+        local capMin = ((SPK_MODE == 1 or S.pcmAudio) and
+            (legacy and 2000 or 8000)) or (legacy and 4000 or 16000)
+
+        local pieces = 0
+        while #S.audioQ > 0
+            and (legacy or apendingCalc() < SPK_PENDING_MAX)
+            and C.audioSec < target
+            and pieces < (legacy and 6 or 64) do
+            local taken, n = {}, 0
+            while #S.audioQ > 0 and n < capMax do
+                local c = table.remove(S.audioQ, 1)
+                S.audioBytes = S.audioBytes - #c
+                taken[#taken + 1] = c
+                n = n + #c
+                if n >= capMin then break end
+            end
+            local piece = table.concat(taken)
+            local payload = piece
+            if S.pcmAudio then
+                payload = {}
+                for i = 1, #piece do
+                    local b2 = piece:byte(i)
+                    payload[i] = b2 < 128 and b2 or b2 - 256
+                end
+            elseif SPK_MODE == 1 then
+                if not audioDecoder then SPK_MODE = 2 end
+            end
+            if SPK_MODE == 1 and audioDecoder then
+                local decOk, pcm = pcall(audioDecoder, piece)
+                if not decOk or pcm == nil then
+                    SPK_MODE = 2
+                elseif type(pcm) == "string" then
+                    payload = {}
+                    for i = 1, #pcm do
+                        local b = pcm:byte(i)
+                        payload[i] = b < 128 and b or b - 256
+                    end
+                elseif type(pcm) == "table" then
+                    payload = pcm
+                else
+                    SPK_MODE = 2
+                end
+            end
+            local ok = false
+            if S.pcmAudio then
+                local callOk = pcall(spk.playAudio, payload, C.vol)
+                if not callOk then
+                    callOk = pcall(spk.playAudio, payload)
+                end
+                if callOk then
+                    ok = true
+                    C.lastSpkErr = nil
+                elseif not C.audioDeadShown then
+                    C.audioDeadShown = true
+                    C.muted = true
+                    toast("NO AUDIO SUPPORT")
+                end
+            elseif SPK_MODE < 2 then
+                local callOk, callErr = pcall(spk.playAudio, payload, C.vol)
+                if not callOk then
+                    callOk = pcall(spk.playAudio, payload)
+                end
+                if callOk then
+                    ok = true
+                    C.lastSpkErr = nil
+                elseif SPK_MODE == 0 and audioDecoder then
+                    SPK_MODE = 1
+                elseif SPK_MODE == 1 then
+                    local retryOk = pcall(spk.playAudio, payload)
+                    if retryOk then
+                        ok = true
+                    else
+                        SPK_MODE = 2
+                        C.lastSpkErr = tostring(callErr)
+                    end
+                else
+                    SPK_MODE = 2
+                    C.lastSpkErr = tostring(callErr)
+                end
+            end
+            if SPK_MODE >= 2 and not C.audioDeadShown then
+                C.audioDeadShown = true
+                C.muted = true
+                toast("NO AUDIO SUPPORT")
+            end
+            if ok then
+                pieces = pieces + 1
+                if S.pcmAudio then
+                    C.audioSec = C.audioSec + n / 48000
+                else
+                    C.audioSec = C.audioSec + n / 6000
+                    C.feedAmt = apendingCalc() + n
+                    C.feedMark = now()
+                end
+            else
+                for i = #taken, 1, -1 do
+                    table.insert(S.audioQ, 1, taken[i])
+                    S.audioBytes = S.audioBytes + #taken[i]
+                end
+                break
+            end
+        end
+    end
+
+    local function seekTo(t, label)
+        t = clamp(t, 0, math.max(0, S.dur - 0.5))
+        spkStop(spk)
+        C.feedAmt = 0
+        C.feedMark = now()
+        S.videoQ = {} S.videoBytes = 0
+        S.audioQ = {} S.audioBytes = 0
+        C.audioSec = t
+        if S.sepAudio then
+            S.audioSeekByte = math.max(0, math.floor(t * 6000))
+        end
+        S.seekReq = t
+        S.seeking = true
+        C.pos = math.floor(t * S.fps)
+        C.seekPending = t
+        C.finished = false
+                toast(label or "SEEK")
+    end
+
+    local function togglePause()
+        if C.finished then return end
+        C.paused = not C.paused
+        C.hudNext = 0
+        if C.paused then
+            spkStop(spk)
+            C.feedAmt = 0
+        else
+            C.t0 = now() - C.pos / S.fps
+        end
+    end
+
+    local function drawHud(elapsed)
+        if C.paused and not C.finished then
+            if not ditherA or #ditherA ~= SW then buildDither(SW) end
+            for y = 0, SH - 1 do
+                drawRow(0, y, (y % 2 == 0) and ditherA or ditherB)
+            end
+            local pw = textWidth("PAUSED", 4)
+            fill(round(SW / 2 - pw / 2) - 16, round(SH / 2) - 26, pw + 32, 44, DEEP)
+            drawText(round(SW / 2 - pw / 2), round(SH / 2) - 19, "PAUSED", WHITE, DEEP, 4)
+            local sub = "SPACE OR TAP TO RESUME"
+            drawText(round(SW / 2 - textWidth(sub, 1) / 2), round(SH / 2) + 10,
+                sub, GREY, DEEP, 1)
+        end
+
+        if C.finished then
+            fill(0, 0, SW, SH, DEEP)
+            local msgs = {
+                { "PLAYBACK FINISHED", 3, WHITE },
+                { fitText(movie.name:upper(), SW - 40, 2), 2, LIGHT },
+                { "PRESS ANY KEY", 1, GREY },
+            }
+            local tot = 0
+            for _, m in ipairs(msgs) do tot = tot + m[2] * 5 + 12 end
+            local y = round((SH - tot) / 2)
+            for _, m in ipairs(msgs) do
+                drawText(round(SW / 2 - textWidth(m[1], m[2]) / 2), y, m[1], m[3], DEEP, m[2])
+                y = y + m[2] * 5 + 12
+            end
+        end
+
+        if S.err then
+            fill(0, SH - 52, SW, 20, RED)
+            local msg = fitText("ERR: " .. S.err:upper() .. "  [R RETRY]", SW - 12, 1)
+            drawText(6, SH - 49, msg, WHITE, RED, 1)
+        elseif S.seeking then
+            drawSpinner(SW - 30, SH - 50, "SEEKING")
+        elseif #S.videoQ == 0 and not S.eof and not C.finished and not C.paused then
+            drawSpinner(SW - 30, SH - 50, "BUFFERING")
+        end
+
+        if C.dbg and S.geo then
+            local info = string.format(
+                "GFX %dx%d VID %dx%d %s Q v=%d a=%ds(%s%s) SYNC %+.1fs DELAY %.1fs SPK m%d %s",
+                SW, SH, S.vw, S.vh, S.geo.scaleLabel,
+                S.videoBytes, S.audioBytes / (S.pcmAudio and 48000 or 6000),
+                tostring(S.sepAudio), tostring(S.audioFileDead == true),
+                (CFG.AUDIO_OFFSET or 0) / 1000,
+                (CFG.AUDIO_LAG_MS or 300) / 1000,
+                SPK_MODE,
+                spk and (C.lastSpkErr and ("ERR " .. C.lastSpkErr) or "ok")
+                   or "NO SPEAKER")
+            fill(0, SH - 62, SW, 12, DEEP)
+            drawText(4, SH - 60, info, GREEN or ACCENT, DEEP, 1)
+        end
+
+        if C.toast and now() < C.toastExp then
+            local m = C.toast
+            local mw = textWidth(m, 2)
+            fill(round(SW / 2 - mw / 2) - 10, 8, mw + 20, 20, DEEP)
+            drawText(round(SW / 2 - mw / 2), 13, m, ACCENT, DEEP, 2)
+        end
+    end
+
+    local function tick()
+        local t = now()
+        if S.eof and #S.videoQ == 0 and not C.finished then
+            C.finished = true
+            C.hudNext = 0
+            spkStop(spk)
+        end
+        if not C.paused and not C.finished and not S.seeking then
+            local due = math.floor((t - C.t0) * S.fps)
+            local drew = nil
+            while C.pos < due and #S.videoQ > 0 do
+                local fr = table.remove(S.videoQ, 1)
+                S.videoBytes = S.videoBytes - fr.sz
+                drew = fr
+                C.pos = C.pos + 1
+            end
+            if drew then drawRows(S.geo.vx, S.geo.vy, drew.rows) end
+            if C.pos < due and #S.videoQ == 0 and not S.eof then
+                C.t0 = t - C.pos / S.fps
+            end
+        end
+        if C.seekPending and not S.seeking then
+            C.t0 = now() - C.seekPending
+            C.seekPending = nil
+        end
+        feedAudio()
+        if t >= (C.hudNext or 0) then
+            C.hudNext = t + 0.1
+            drawHud(C.pos / S.fps)
+        end
+        if C.toast and now() >= C.toastExp then C.toast = nil end
+    end
+
+    fill(0, 0, SW, SH, BLACK)
+    drawSpinner(round(SW / 2), round(SH / 2), "LOADING " .. movie.name:upper())
+
+    local timer = os.startTimer(0.05)
+    C.running = true
+
+    local function control()
+    while C.running do
+        local ev, p1, p2, p3 = os.pullEventRaw()
+        if ev == "timer" and p1 == timer then
+            tick()
+            timer = os.startTimer(0.04)
+        elseif ev == "key" then
+            local k = p1
+            if C.finished then
+                C.running = false S.stop = true
+            elseif k == keys.q or k == keys.x or k == keys.escape
+               or k == keys.backspace then
+                C.running = false S.stop = true
+            elseif k == keys.space or k == keys.p or k == keys.enter then
+                togglePause()
+            elseif k == keys.left then
+                seekTo(C.pos / S.fps - 10, "-10S")
+            elseif k == keys.right then
+                seekTo(C.pos / S.fps + 10, "+10S")
+            elseif k == keys.up then
+                C.vol = clamp(C.vol + 0.25, 0, 3)
+                CFG.VOLUME = C.vol saveCfg()
+                toast("VOL " .. round(C.vol * 100) .. "%")
+            elseif k == keys.down then
+                C.vol = clamp(C.vol - 0.25, 0, 3)
+                CFG.VOLUME = C.vol saveCfg()
+                toast("VOL " .. round(C.vol * 100) .. "%")
+            elseif k == keys.f then
+                C.dbg = not C.dbg
+                C.hudNext = 0
+            elseif k == keys.comma or p1 == keys.comma then
+                CFG.AUDIO_OFFSET = clamp((CFG.AUDIO_OFFSET or 0) - 100, -5000, 5000)
+                saveCfg()
+                C.hudNext = 0
+                toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
+            elseif k == keys.period or p1 == keys.period then
+                CFG.AUDIO_OFFSET = clamp((CFG.AUDIO_OFFSET or 0) + 100, -5000, 5000)
+                saveCfg()
+                C.hudNext = 0
+                toast(string.format("SYNC %.1fs", (CFG.AUDIO_OFFSET or 0) / 1000))
+            elseif k == keys.m then
+                C.muted = not C.muted
+                if C.muted then spkStop(spk) C.feedAmt = 0 end
+                toast(C.muted and "MUTED" or "SOUND ON")
+            elseif k == keys.r then
+                S.err = nil
+                S.audioFileDead = nil
+                SPK_MODE = (audioDecoder or SPK_MODE ~= 0) and SPK_MODE or 0
+                C.audioDeadShown = false
+                C.hudNext = 0
+            end
+        elseif ev == "monitor_touch" then
+            local cx = tonumber(p2) or 0
+            local cy = tonumber(p3) or 0
+            local pts = {
+                { cx * 6 - 3, cy * 9 - 4 },
+                { cx * 6 + 3, cy * 9 + 4 },
+                { cx, cy },
+            }
+            local action = nil
+            for _, pt in ipairs(pts) do
+                if C.finished then action = "quit"
+                elseif S.err then action = "retry"
+                elseif pt[1] > SW - 22 and pt[2] > SH - 42 then
+                    action = "quit"
+                elseif pt[2] <= SH then
+                    if pt[1] < SW / 3 then action = "back"
+                    elseif pt[1] > 2 * SW / 3 then action = "fwd"
+                    else action = "toggle" end
+                end
+                if action then break end
+            end
+            if action == "quit" then
+                C.running = false S.stop = true
+            elseif action == "retry" then
+                S.err = nil C.hudNext = 0
+            elseif action == "toggle" then
+                togglePause()
+            elseif action == "back" then
+                seekTo(C.pos / S.fps - 10, "-10S")
+            elseif action == "fwd" then
+                seekTo(C.pos / S.fps + 10, "+10S")
+            end
+        elseif ev == "speaker_audio_empty" then
+            C.sawEmpty = true
+            C.feedAmt = 0
+            C.feedMark = now()
+        elseif ev == "terminate" then
+            C.running = false S.stop = true
+            C.terminated = true
+        end
+    end
+    end
+
+    local threads = { function() downloader(S) end }
+    if S.sepAudio and not S.audioFileDead then
+        threads[#threads + 1] = function() audioStreamer(S) end
+    end
+    threads[#threads + 1] = control
+    parallel.waitForAny(table.unpack(threads))
+
+    S.stop = true
+    spkStop(spk)
+    return C.terminated == true
+end
+
+
+local function fetchList()
+    local txt, err = httpGetText(CFG.BASE_URL .. "/movies.txt")
+    if not txt then return nil, err end
+    local items = {}
+    for rawline in txt:gmatch("[^\r\n]+") do
+        local line = (rawline:gsub("^%s+", "")):gsub("%s+$", "")
+        if #line > 0 then
+            local name, secs = line:match("^(.-)%s+(%d+%.?%d*)$")
+            if name then
+                items[#items + 1] = { name = name, dur = tonumber(secs) }
+            else
+                items[#items + 1] = { name = line, dur = nil }
+            end
+        end
+    end
+    table.sort(items, function(a, b) return a.name:lower() < b.name:lower() end)
+    return items
+end
+
+local function fetchMeta(name)
+    local e = urlenc(name)
+    local txt, err = httpGetText(CFG.BASE_URL .. "/" .. e .. "/" .. e .. ".meta")
+    if not txt then return nil, err end
+    local vals = {}
+    for v in txt:gmatch("%S+") do vals[#vals + 1] = v end
+    return {
+        w = tonumber(vals[1]), h = tonumber(vals[2]),
+        fps = tonumber(vals[3]) or 30,
+        parts = tonumber(vals[4]) or 1,
+        blk = tonumber(vals[5]) or 1,
+        mode = tonumber(vals[6]) or 0,
+        hasAudio = tonumber(vals[7]) or 0,
+        pcm = (tonumber(vals[7]) or 0) == 2,
+    }
+end
+
+
+local function fetchExtras(name)
+    local e = urlenc(name)
+    local dir = CFG.BASE_URL .. "/" .. e
+    local desc = httpGetText(dir .. "/" .. e .. ".desc.txt")
+    if desc then desc = desc:gsub("\r", "") end
+    local thumb = nil
+    local mt = httpGetText(dir .. "/" .. e .. ".thumb.meta")
+    if mt then
+        local dims = {}
+        for v in mt:gmatch("%d+") do dims[#dims + 1] = tonumber(v) end
+        local tw, th = dims[1] or 128, dims[2] or 72
+        local r = http.get(dir .. "/" .. e .. ".thumb", nil, true)
+        if r then
+            local data = r.readAll()
+            pcall(function() r.close() end)
+            if data and #data >= tw * th then
+                thumb = { w = tw, h = th, data = data:sub(1, tw * th) }
+            end
+        end
+    end
+    return desc, thumb
+end
+
+local function wrapText(s, maxChars)
+    local out = {}
+    for para in (s .. "\n"):gmatch("([^\n]*)\n") do
+        if para == "" then
+            out[#out + 1] = ""
+        else
+            local line = ""
+            for word0 in para:gmatch("%S+") do
+                local word = word0
+                while #word > maxChars do
+                    if line ~= "" then
+                        out[#out + 1] = line
+                        line = ""
+                    end
+                    out[#out + 1] = word:sub(1, maxChars)
+                    word = word:sub(maxChars + 1)
+                end
+                if #line == 0 then line = word
+                elseif #line + 1 + #word <= maxChars then
+                    line = line .. " " .. word
+                else
+                    out[#out + 1] = line
+                    line = word
+                end
+            end
+            out[#out + 1] = line
+        end
+    end
+    return out
+end
+
+
+local ITEM_H = 46
+
+local function centerText(y, s, fg, bg, scale)
+    drawText(round(SW / 2 - textWidth(s, scale) / 2), y, s, fg, bg, scale)
+end
+
+local function messageScreen(lines)
+    fill(0, 0, SW, SH, BG)
+    local tot = 0
+    for _, l in ipairs(lines) do tot = tot + l[2] * 5 + 14 end
+    local y = round((SH - tot) / 2)
+    for _, l in ipairs(lines) do
+        centerText(y, fitText(l[1], SW - 40, l[2]), l[3], BG, l[2])
+        y = y + l[2] * 5 + 14
+    end
+end
+
+local function drawMenuItem(y, item, selected, w)
+    local bgc = selected and DEEP or BG
+    if selected then
+        fill(0, y, w, ITEM_H - 6, DEEP)
+        fill(0, y, 4, ITEM_H - 6, ACCENT)
+    end
+    local fg = selected and ACCENT or PANEL2
+    local rows = { "#....", "##...", "###..", "##...", "#...." }
+    for r = 1, 5 do
+        local seg = {}
+        for c = 1, 5 do
+            seg[#seg + 1] = string.rep(string.char(
+                rows[r]:sub(c, c) == "#" and fg or bgc), 2)
+        end
+        drawRow(16, y + 12 + (r - 1) * 2, table.concat(seg))
+    end
+    drawText(38, y + 8, fitText(item.name:upper(), w - 150, 2),
+        selected and WHITE or LIGHT, bgc, 2)
+    drawText(38, y + 24, item.dur and (fmtTime(item.dur)) or "MOVIE",
+        GREY, bgc, 1)
+end
+
+local function menuScreen()
+    local items, listErr = nil, nil
+    local sel, scroll = 1, 0
+    local loading = true
+    local visible = math.max(1, math.floor((SH - 100) / ITEM_H))
+
+    local function startFetch()
+        loading = true
+        items = nil
+        listErr = nil
+        parallel.waitForAny(
+            function()
+                local ok, it, e = pcall(fetchList)
+                if ok then items, listErr = it, e else listErr = it end
+                loading = false
+            end,
+            function()
+                while loading do
+                    drawSpinner(round(SW / 2), round(SH / 2), "FETCHING LIST")
+                    sleep(0.08)
+                end
+            end)
+    end
+
+    local function render()
+        fill(0, 0, SW, SH, BG)
+        fill(0, 0, SW, 42, PANEL)
+        fill(0, 42, SW, 1, PANEL2)
+        drawText(10, 8, "CC CINEMA", WHITE, PANEL, 3)
+        drawText(10 + textWidth("CC CINEMA", 3) + 12, 18, "CLOUD STREAM V4",
+            ACCENT, PANEL, 1)
+        for x = 0, SW - 1 do
+            drawRow(x, 40, string.char(36 * (1 + math.floor(
+                4 * x / math.max(SW - 1, 1))) + 30))
+        end
+
+        if loading then return end
+        if listErr then
+            messageScreen({
+                { "FAILED TO LOAD MOVIES", 2, RED },
+                { fitText(tostring(listErr):upper(), SW - 60, 1), 1, GREY },
+                { "[R] RETRY      [U] CHANGE URL", 1, ACCENT },
+            })
+            return
+        end
+        if #items == 0 then
+            messageScreen({
+                { "NO MOVIES YET", 2, ACCENT2 },
+                { "RUN: PYTHON PREPARE.PY <VIDEO.MP4>  (MODE 3)", 1, GREY },
+            })
+            return
+        end
+
+        if sel < scroll + 1 then scroll = sel end
+        if sel > scroll + visible - 1 then scroll = sel - visible + 1 end
+        scroll = clamp(scroll, 1, math.max(1, #items - visible + 1))
+
+        for idx = scroll, math.min(#items, scroll + visible - 1) do
+            local y = 54 + (idx - scroll) * ITEM_H
+            drawMenuItem(y, items[idx], idx == sel, SW)
+        end
+        if scroll > 1 then centerText(SH - 34, "^ MORE", GREY, BG, 1) end
+        if scroll + visible <= #items then centerText(SH - 26, "v MORE", GREY, BG, 1) end
+
+        fill(0, SH - 16, SW, 16, PANEL)
+        fill(0, SH - 16, SW, 1, PANEL2)
+        local hint = "^V SELECT   ENTER PLAY   U URL   R REFRESH   ESC QUIT"
+        centerText(SH - 11, fitText(hint, SW - 20, 1), GREY, PANEL, 1)
+        local posStr = tostring(sel) .. "/" .. tostring(#items)
+        drawText(SW - textWidth(posStr, 1) - 8, SH - 11, posStr, LIGHT, PANEL, 1)
+    end
+
+    local function infoScreen(item, m, desc, thumb)
+        local lines = {}
+        if desc and #desc > 0 then
+            lines = wrapText(desc:upper(), math.floor((SW - 48) / 10))
+        end
+        local view = 0
+
+        local trows, tw2, th2
+        if thumb then
+            tw2, th2 = thumb.w, thumb.h
+            local z = math.max(1, math.floor(math.min((SW - 100) / tw2,
+                84 / th2)))
+            tw2, th2 = tw2 * z, th2 * z
+            trows = {}
+            for y = 1, thumb.h do
+                local row = thumb.data:sub((y - 1) * thumb.w + 1,
+                                           y * thumb.w)
+                row = expandRow(row, z)
+                for k = 1, z do trows[#trows + 1] = row end
+            end
+        end
+
+        local irender = function()
+            fill(0, 0, SW, SH, BG)
+            drawText(12, 6, fitText(item.name:upper(), SW - 24, 2),
+                WHITE, BG, 2)
+            drawText(12, 22, fmtTime(item.dur or 0) .. "   "
+                .. tostring(m.parts) .. " PARTS   " .. tostring(m.fps) .. " FPS",
+                GREY, BG, 1)
+            fill(0, 32, SW, 1, PANEL2)
+
+            local ty = 40
+            if trows then
+                fill(10, ty - 3, tw2 + 6, th2 + 6, PANEL)
+                term.drawPixels(13, ty, trows)
+                ty = ty + th2 + 16
+            end
+            local availH = SH - 42 - ty
+            local maxVis = math.max(1, math.floor(availH / 14))
+            view = clamp(view, 0, math.max(0, #lines - maxVis))
+            for i = 1, maxVis do
+                local ln = lines[view + i]
+                if not ln then break end
+                drawText(12, ty + (i - 1) * 14, fitText(ln, SW - 44, 2),
+                    LIGHT, BG, 2)
+            end
+            if #lines > maxVis then
+                local barH = math.max(12, math.floor(availH *
+                    maxVis / #lines))
+                local barY = ty + math.floor((availH - barH) *
+                    (view / math.max(1, #lines - maxVis)))
+                fill(SW - 10, ty, 5, availH, PANEL)
+                fill(SW - 10, barY, 5, barH, ACCENT)
+            end
+            fill(0, SH - 30, SW, 30, PANEL)
+            fill(0, SH - 30, SW, 1, PANEL2)
+            centerText(SH - 15,
+                fitText("ENTER PLAY     UP/DOWN SCROLL     ESC BACK",
+                    SW - 20, 2), GREY, PANEL, 2)
+        end
+
+        irender()
+        while true do
+            local ev, p1 = os.pullEventRaw()
+            if ev == "key" then
+                if p1 == keys.enter or p1 == keys.space then
+                    return true
+                elseif p1 == keys.escape or p1 == keys.q
+                    or p1 == keys.backspace then
+                    return false
+                elseif p1 == keys.up and view > 0 then
+                    view = view - 3
+                    irender()
+                elseif p1 == keys.down and view < math.max(0, #lines - 1) then
+                    view = view + 3
+                    irender()
+                end
+            elseif ev == "mouse_scroll" then
+                view = clamp(view + p1 * 3, 0, math.max(0, #lines))
+                irender()
+            elseif ev == "monitor_touch" then
+                local py = (tonumber(p2) or 1) * 9
+                if py > SH - 30 then
+                    return true
+                end
+                view = clamp(view + 3, 0, math.max(0, #lines))
+                irender()
+            elseif ev == "terminate" then
+                return false
+            end
+        end
+    end
+
+    local function play(item)
+        local m = fetchMeta(item.name)
+        if not m then
+            messageScreen({
+                { "META MISSING", 2, RED },
+                { fitText(tostring(item.name):upper(), SW - 40, 1), 1, GREY },
+                { "WAS IT ENCODED WITH PREPARE.PY?", 1, GREY },
+            })
+            sleep(2.5)
+            return
+        end
+        if m.mode ~= 3 then
+            messageScreen({
+                { "NOT A GFX ENCODE", 2, RED },
+                { "RE-RUN PREPARE.PY AND PICK MODE 3 (PIXEL/GFX)", 1, GREY },
+            })
+            sleep(2.5)
+            return
+        end
+
+                local okD, desc, thumb = pcall(fetchExtras, item.name)
+        if okD and ((desc and #desc > 0) or thumb) then
+            render()
+            if not infoScreen(item, m, desc, thumb) then
+                render()
+                return
+            end
+        end
+        local terminated = player(peripheral.find("speaker"), {
+            name = item.name,
+            dur = item.dur or 0,
+            parts = m.parts,
+            fps = m.fps,
+            metaW = m.w,
+            metaH = m.h,
+            sepAudio = m.hasAudio == 1,
+            pcmAudio = m.pcm,
+        })
+        return terminated
+    end
+
+    startFetch()
+    render()
+    while true do
+        local ev, p1, p2, p3 = os.pullEventRaw()
+        if ev == "key" then
+            local k = p1
+            if k == keys.up or k == keys.w then
+                if items and #items > 0 then
+                    sel = clamp(sel - 1, 1, #items)
+                    render()
+                end
+            elseif k == keys.down or k == keys.s then
+                if items and #items > 0 then
+                    sel = clamp(sel + 1, 1, #items)
+                    render()
+                end
+            elseif k == keys.enter or k == keys.space then
+                if items and items[sel] then
+                    if play(items[sel]) then return true end
+                    render()
+                end
+            elseif k == keys.r then
+                startFetch()
+                render()
+            elseif k == keys.u then
+                promptUrl()
+                startFetch()
+                render()
+            elseif k == keys.q or k == keys.escape then
+                return false
+            end
+        elseif ev == "monitor_touch" then
+            local px = (tonumber(p2) or 1) * 6 - 3
+            local py = (tonumber(p3) or 1) * 9 - 4
+            if px >= 0 and py >= 54 and py < 54 + visible * ITEM_H
+               and items and #items > 0 then
+                local idx = scroll + math.floor((py - 54) / ITEM_H)
+                if idx >= 1 and idx <= #items then
+                    if idx == sel then
+                        if play(items[idx]) then return true end
+                    else
+                        sel = idx
+                    end
+                    render()
+                end
+            end
+        elseif ev == "mouse_scroll" then
+            if items and #items > 0 then
+                sel = clamp(sel + p1, 1, #items)
+                render()
+            end
+        elseif ev == "terminate" then
+            return false
+        end
+    end
+end
+
+
+local function findMonitor()
+    local best = nil
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "monitor" then
+            local p = peripheral.wrap(name)
+            local w, h = p.getSize()
+            if not best or w * h > best.w * best.h then
+                best = { p = p, name = name, w = w, h = h }
+            end
+        end
+    end
+    return best
+end
+
+local oldScale = nil
+
+local function cleanup(mon)
     pcall(function()
-        if kind == "move" then sp.playNote("bit", v, 16)
-        elseif kind == "open" then
-            sp.playNote("bit", v, 16)
-            sp.playNote("bit", v * 0.8, 21)
-        elseif kind == "back" then sp.playNote("bit", v, 9)
-        elseif kind == "toggle" then sp.playNote("bit", v, 19)
-        elseif kind == "error" then sp.playNote("bit", v, 5)
-        elseif kind == "boot" then
-            sp.playNote("bit", v * 0.7, 12)
-            sp.playNote("bit", v * 0.7, 19)
-        elseif kind == "jingle" then
-            sp.playNote("pling", v * 0.6, 12)
-            sp.playNote("pling", v * 0.6, 16)
-            sp.playNote("pling", v * 0.6, 19)
-        else sp.playNote("bit", v, 12) end
+        term.setGraphicsMode(false)
+        if mon and mon.p and oldScale then mon.p.setTextScale(oldScale) end
+        term.clear()
+    end)
+    pcall(function() term.restore() end)
+end
+
+local function main()
+    loadCfg()
+    while not CFG.BASE_URL or CFG.BASE_URL == "" do
+        if not promptUrl() then sleep(1) end
+    end
+
+    local mon = findMonitor()
+    if not mon then
+        error("No monitor attached - place one next to the computer.", 0)
+    end
+
+    print("[cinema] monitor: " .. mon.name)
+    print("[cinema] server : " .. CFG.BASE_URL)
+
+    pcall(function() oldScale = mon.p.getTextScale() end)
+    pcall(function() mon.p.setTextScale(CFG.TEXT_SCALE or 0.5) end)
+    term.redirect(mon.p)
+
+    if not term.setGraphicsMode then
+        term.restore()
+        error("CC:Graphics not detected (term.setGraphicsMode missing).", 0)
+    end
+    term.setGraphicsMode(2)
+    probePixelFormat()
+
+    local tw, th = term.getSize()
+    local ok2, pw, ph = pcall(term.getSize, 2)
+    if ok2 and pw and pw ~= tw then
+        SW, SH = pw, ph
+    else
+        SW, SH = tw * 6, th * 9
+    end
+
+    setupPalette()
+    fill(0, 0, SW, SH, BG)
+    centerText(round(SH / 2) - 10, "CC CINEMA", WHITE, BG, 3)
+    centerText(round(SH / 2) + 14, "CONNECTING...", GREY, BG, 1)
+
+    local quit = menuScreen()
+    cleanup(mon)
+    if quit then return end
+end
+
+local function crashCard(err)
+    local mon = findMonitor()
+    cleanup(mon)
+    term.setTextColor(colors.red)
+    print("\n[cinema] crashed: " .. tostring(err))
+    pcall(function()
+        if not mon then return end
+        term.redirect(mon.p)
+        term.setBackgroundColour(colors.black)
+        term.setTextColour(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("CC CINEMA CRASHED\n")
+        local msg = tostring(err)
+        local w = select(1, term.getSize())
+        while #msg > 0 do
+            print(msg:sub(1, w))
+            msg = msg:sub(w + 1)
+        end
     end)
 end
 
-local function blinds()
-    local sw = 8
-    local colsN = math.ceil(MW / sw)
-    for step = 1, 4 do
-        for ci = 0, colsN - 1 do
-            if (ci % 4) + 1 == step then
-                local x = ci * sw + 1
-                local wpart = math.min(sw, MW - x + 1)
-                local h = math.ceil(step * MH / 4)
-                mon.setBackgroundColour(colours.blue)
-                for r = 1, h do
-                    mon.setCursorPos(x, r)
-                    mon.write(string.rep(" ", wpart))
-                end
-            end
-        end
-        sleep(0.05)
-    end
-    mon.setBackgroundColour(colours.black)
-end
-
-local CARD_W, CARD_H = 17, 9
-local GAPX, GAPY = 2, 1
-local HEADER_ROWS = 8
-
-local TOAST_MSG, TOAST_UNTIL = nil, 0
-local function showToast(m)
-    TOAST_MSG, TOAST_UNTIL = m, os.clock() + 1.8
-end
-
-local function homeMenu(movies, online)
-    local items = {}
-    for _, m in ipairs(movies) do
-        items[#items + 1] = {
-            label = m.label, dur = m.dur,
-            kind = "movie",
-            isNew = not seen[m.label],
-        }
-    end
-    items[#items + 1] = { label = "Settings", kind = "settings", sub = "audio sync" }
-    local n = #items
-
-    local cols = math.max(1, math.floor((MW - 2) / (CARD_W + GAPX)))
-    local rows = math.max(1, math.min(4, math.floor((MH - HEADER_ROWS - 3) / (CARD_H + GAPY))))
-    local totalCols = math.ceil(n / rows)
-    local pages = math.max(1, math.ceil(totalCols / cols))
-    local cardsY = HEADER_ROWS + 1
-
-    local sel = 1
-    local c0 = 0
-    local anim = nil
-    local tick = 0
-    local comet = nil
-    local onlineNow = online
-    local lastFetch = os.clock()
-    local refreshInflight = false
-
-    local function recalc()
-        n = #items
-        totalCols = math.ceil(n / rows)
-        pages = math.max(1, math.ceil(totalCols / cols))
-        if sel > n then sel = n end
-    end
-
-    local function applyMovieList(list)
-        movies = list
-        local keep = items[sel]
-        for i = #items, 1, -1 do items[i] = nil end
-        for _, m in ipairs(list) do
-            items[#items + 1] = {
-                label = m.label, dur = m.dur,
-                kind = "movie",
-                isNew = not seen[m.label],
-            }
-        end
-        items[#items + 1] = { label = "Settings", kind = "settings", sub = "audio sync" }
-        recalc()
-        if keep then
-            for i = 1, n do
-                if items[i].label == keep.label then sel = i break end
-            end
-        end
-    end
-
-    local function drawStatusChip()
-        segments(5, MW - 17, {
-            { t = onlineNow and " ONLINE " or " OFFLINE", c = colours.black },
-        }, onlineNow and colours.green or colours.red)
-    end
-
-    local function selCol() return math.floor((sel - 1) / rows) end
-    local function selColOf(i) return math.floor((i - 1) / rows) end
-    local function selRow() return (sel - 1) % rows end
-
-    local function ensureVisible()
-        local c = selCol()
-        if c < c0 or c >= c0 + cols then
-            anim = { from = c0, to = c - math.floor(cols / 2) + (c < c0 and cols or 0) }
-            anim.to = (c < c0) and c or (c - cols + 1)
-            anim.t = 0
-        end
-    end
-
-    local function viewX()
-        if anim then
-            local f = math.min(1, anim.t)
-            return math.floor(anim.from + (anim.to - anim.from) * f + 0.5)
-        end
-        return c0
-    end
-
-    local ACCENTS = { colours.lime, colours.cyan, colours.purple, colours.orange,
-                      colours.lightBlue, colours.pink, colours.magenta, colours.green }
-
-    local function drawCardReal(it, idx, x, y, selected, pressed)
-        local vw = math.min(CARD_W, MW - x + 1)
-        if vw < 6 then return end
-        local acc = it.kind == "settings" and colours.orange or ACCENTS[((idx - 1) % #ACCENTS) + 1]
-        -- border ring: bright for the focused card, quiet otherwise
-        local ring = pressed and colours.white or (selected and colours.white or colours.grey)
-        mon.setBackgroundColour(ring)
-        for c = 0, CARD_W - 3 do
-            mon.setCursorPos(x + 1 + c, y)
-            mon.write(" ")
-            mon.setCursorPos(x + 1 + c, y + CARD_H - 1)
-            mon.write(" ")
-        end
-        for r = 1, CARD_H - 2 do
-            mon.setCursorPos(x + 1, y + r)
-            mon.write(" ")
-            mon.setCursorPos(x + CARD_W - 2, y + r)
-            mon.write(" ")
-        end
-        -- poster body
-        mon.setBackgroundColour(acc)
-        for r = 2, CARD_H - 3 do
-            mon.setCursorPos(x + 2, y + r)
-            mon.write(string.rep(" ", math.min(CARD_W - 4, MW - x - 3)))
-        end
-        -- giant initial centred in the poster zone (glyphs are 5 rows tall,
-        -- the interior is exactly CARD_H-4 rows: made to measure)
-        local ch = it.label:sub(1, 1):upper()
-        if GLYPH[ch] then
-            local gx = x + 2 + math.floor((CARD_W - 4 - 5) / 2)
-            if gx + 5 <= MW + 1 then
-                drawGlyph(ch, gx, y + 2,
-                    selected and colours.black or colours.grey)
-            end
-        end
-        -- title strip along the bottom of the card
-        local maxT = math.min(CARD_W - 4, MW - (x + 2) + 1)
-        if maxT > 0 then
-            mon.setBackgroundColour(pressed and colours.white or colours.black)
-            mon.setTextColour(selected and colours.yellow or colours.lightGrey)
-            mon.setCursorPos(x + 2, y + CARD_H - 2)
-            mon.write(it.label:sub(1, maxT))
-        end
-        if it.isNew and it.kind ~= "settings" then
-            chip(math.min(x + CARD_W - 5, MW - 3), y, "NEW", colours.yellow, colours.black)
-        end
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local function drawGrid(stagger)
-        local vx = viewX()
-        local cA = math.max(0, vx)
-        local cB = vx + cols
-        mon.setBackgroundColour(colours.black)
-        local bandH = rows * (CARD_H + GAPY) - GAPY
-        for r = 0, bandH - 1 do
-            mon.setCursorPos(1, cardsY + r)
-            mon.write(string.rep(" ", MW))
-        end
-        local drawn = 0
-        for c = cA, cB do
-            for r = 0, rows - 1 do
-                local idx = c * rows + r + 1
-                local it = items[idx]
-                if it then
-                    local x = 2 + (c - vx) * (CARD_W + GAPX)
-                    local y = cardsY + r * (CARD_H + GAPY)
-                    drawCardReal(it, idx, x, y, idx == sel)
-                    if stagger then
-                        drawn = drawn + 1
-                        if drawn % 4 == 0 then sleep(0.03) end
-                    end
-                end
-            end
-        end
-        if n <= 1 then
-            mon.setTextColour(colours.lightGrey)
-            mon.setCursorPos(2, cardsY + bandH + 1)
-            mon.write("(no movies yet - transcode one with prepare.py)")
-        end
-        if pages > 1 then
-            local page = math.floor(c0 / cols) + 1
-            local dy = cardsY + rows * (CARD_H + GAPY) + (n <= 1 and 1 or 0)
-            local dx = math.max(1, math.floor((MW - pages * 2) / 2) + 1)
-            for p = 1, pages do
-                mon.setTextColour(colours.black)
-                mon.setBackgroundColour(p == page and colours.lime or colours.lightGrey)
-                mon.setCursorPos(dx + (p - 1) * 2, dy)
-                mon.write("\7")
-            end
-            mon.setBackgroundColour(colours.black)
-        end
-    end
-
-    local function metaW() return MW >= 44 and 13 or 0 end
-
-    local function drawHero()
-        -- rows 2-6: selected title in big glyphs + meta column on the right
-        local it = items[sel]
-        mon.setBackgroundColour(colours.black)
-        for r = 2, 6 do
-            mon.setCursorPos(1, r)
-            mon.write(string.rep(" ", MW))
-        end
-        if not it then return end
-        local metaW = MW >= 44 and 13 or 0
-        local metaX = MW - metaW + 1
-        local maxW = math.max(8, (metaW > 0 and metaX - 4 or MW - 3))
-        local label = it.label:upper()
-        local line1 = ""
-        for w in label:gmatch("%S+") do
-            local cand = line1 == "" and w or (line1 .. " " .. w)
-            if wordWidth(cand) <= maxW then line1 = cand end
-        end
-        if #line1 > 0 and wordWidth(line1) <= maxW then
-            drawWord(line1, 2, 2, colours.white)
-        elseif #label > 0 then
-            mon.setTextColour(colours.white)
-            mon.setCursorPos(2, 4)
-            mon.write(label:sub(1, math.min(#label, maxW)))
-        end
-        if metaW > 0 then
-            chip(metaX, 2, string.rep(" ", metaW - 1), colours.grey, colours.black)
-            mon.setTextColour(colours.black)
-            mon.setCursorPos(metaX + 1, 2)
-            mon.write(fmtDur(it.dur) or it.sub or "VIDEO")
-            if it.isNew and it.kind == "movie" then
-                chip(metaX, 3, " NEW ", colours.yellow, colours.black)
-            else
-                chip(metaX, 3, string.rep(" ", metaW - 1), colours.black, colours.black)
-            end
-            mon.setTextColour(colours.lightGrey)
-            mon.setBackgroundColour(colours.black)
-            mon.setCursorPos(metaX, 4)
-            mon.write((("%d/%d"):format(sel, n)):sub(1, metaW - 1))
-            chip(metaX, 5, " PLAY \7 ", colours.lime, colours.black)
-        end
-    end
-
-    local function drawInfoLine()
-        mon.setBackgroundColour(colours.black)
-        mon.setCursorPos(2, HEADER_ROWS)
-        mon.write(string.rep(" ", MW - 2))
-        local it = items[sel]
-        if it and it.kind == "movie" and metaW() == 0 then
-            mon.setTextColour(colours.lightGrey)
-            mon.setCursorPos(2, HEADER_ROWS)
-            mon.write(("%d/%d"):format(sel, n))
-            if it.dur then
-                mon.write("  " .. fmtDur(it.dur))
-            end
-            if it.isNew then
-                chip(math.max(1, MW - 11), HEADER_ROWS, " UNWATCHED ", colours.yellow, colours.black)
-            end
-        end
-    end
-
-    local function drawChrome()
-        mon.setBackgroundColour(colours.black)
-        mon.clear()
-        -- slim marquee strip across the very top
-        mon.setBackgroundColour(colours.red)
-        mon.setCursorPos(1, 1)
-        mon.write(string.rep(" ", MW))
-        mon.setBackgroundColour(colours.black)
-        local cs = clockStr()
-        if cs ~= "" then
-            mon.setTextColour(colours.white)
-            mon.setCursorPos(math.max(1, MW - #cs + 1), 7)
-            mon.write(cs)
-        end
-        segments(7, MW - 17, {
-            { t = online and " ONLINE " or " OFFLINE", c = colours.black },
-        }, online and colours.green or colours.red)
-        drawHero()
-        -- divider (left segment only; status chip + clock own the right)
-        mon.setBackgroundColour(colours.grey)
-        mon.setCursorPos(1, 7)
-        mon.write(string.rep(" ", math.max(0, MW - 18)))
-        mon.setBackgroundColour(colours.black)
-        drawInfoLine()
-        segments(MH, 1, {
-            { t = " <>", c = colours.red },
-            { t = " browse", c = colours.white },
-            { t = "   Enter", c = colours.red },
-            { t = " play", c = colours.white },
-            { t = "   tap", c = colours.orange },
-            { t = " card", c = colours.white },
-            { t = "   H", c = colours.red },
-            { t = " help", c = colours.white },
-        }, colours.black)
-        mon.setBackgroundColour(colours.grey)
-        mon.setCursorPos(math.max(1, MW - 9), MH)
-        mon.setTextColour(colours.black)
-        mon.write(tostring(n) .. " items ")
-    end
-
-    local function helpOverlay()
-        box(4, 4, math.min(MW - 8, 44), 13, colours.cyan)
-        chip(6, 4, " CONTROLS ", colours.cyan, colours.black)
-        local lines = {
-            { "<> / tap edges",   "browse pages" },
-            { "up/down",          "switch row" },
-            { "Enter / tap card", "play" },
-            { "R / tap status",   "refresh list" },
-            { "SPACE or tap",     "pause / resume" },
-            { "Q / BACKSPACE",    "back to menu" },
-            { "in player:",       "MENU chip exits" },
-        }
-        for i, l in ipairs(lines) do
-            mon.setTextColour(colours.white)
-            mon.setCursorPos(6, 4 + i)
-            mon.write(l[1])
-            mon.setTextColour(colours.lightBlue)
-            mon.setCursorPos(6 + 16, 4 + i)
-            mon.write(l[2])
-        end
-        centre(4 + 9, "press any key or tap to close", colours.lightGrey)
-        os.pullEvent()
-        blip("back")
-    end
-
-    local function saverLoop()
-        local sx, sy = 3, 3
-        local dx, dy = 1, 1
-        while true do
-            mon.setBackgroundColour(colours.black)
-            mon.clear()
-            drawLogo(sx, sy)
-            centre(MH - 2, clockStr(), colours.lightBlue)
-            local step = 0.12
-            sx = sx + dx * 3
-            sy = sy + dy
-            if sx < 1 then sx = 1; dx = 1 end
-            if sy < 1 then sy = 1; dy = 1 end
-            if sx + 25 > MW then sx = MW - 25; dx = -1 end
-            if sy + 5 > MH then sy = MH - 5; dy = -1 end
-            local id = os.startTimer(step)
-            local ev = os.pullEvent()
-            if ev == "key" or ev == "monitor_touch" then
-                blip("back")
-                return
-            end
-        end
-    end
-
-    local lastEvent = os.clock()
-    drawChrome()
-    drawGrid(true)
-    while true do
-        local id = os.startTimer(0.1)
-        local ev, a, b, cc = os.pullEvent()
-
-        if os.clock() - lastEvent > IDLE_SAVER then
-            saverLoop()
-            drawChrome()
-            drawGrid(true)
-            lastEvent = os.clock()
-        end
-
-        if ev == "timer" and a == id then
-            tick = tick + 1
-            if not refreshInflight and os.clock() - lastFetch >= 5 then
-                lastFetch = os.clock()
-                refreshInflight = true
-                http.request(BASE .. "/movies.txt")
-            end
-            if tick % 5 == 0 then
-                local cs = clockStr()
-                local cpos = cs:find(":", 1, true)
-                if cs ~= "" and cpos then
-                    mon.setBackgroundColour(colours.black)
-                    mon.setTextColour(tick % 10 < 5 and colours.lightBlue or colours.grey)
-                    mon.setCursorPos(math.max(1, MW - #cs + 1) + cpos - 1, 7)
-                    mon.write(tick % 10 < 5 and ":" or " ")
-                end
-            end
-            if tick % 3 == 0 then
-                local sx2 = ((math.floor(tick / 3) * 7) % (MW - 8)) + 2
-                mon.setTextColour(colours.lightGrey)
-                mon.setBackgroundColour(colours.black)
-                mon.setCursorPos(2, 6)
-                mon.write(string.rep("\127", MW - 2))
-                mon.setBackgroundColour(colours.cyan)
-                mon.setCursorPos(sx2, 6)
-                mon.write("    ")
-                mon.setBackgroundColour(colours.black)
-            end
-            if TOAST_MSG then
-                if os.clock() > TOAST_UNTIL then
-                    mon.setBackgroundColour(colours.black)
-                    mon.setCursorPos(MW - #TOAST_MSG - 3, MH - 1)
-                    mon.write(string.rep(" ", #TOAST_MSG + 2))
-                    TOAST_MSG = nil
-                else
-                    chip(MW - #TOAST_MSG - 3, MH - 1,
-                         " " .. TOAST_MSG .. " ", colours.lime, colours.black)
-                    mon.setBackgroundColour(colours.black)
-                end
-            end
-            if comet then
-                comet.t = comet.t + 0.4
-                local gx = math.floor(comet.fx + (comet.tx - comet.fx) * math.min(1, comet.t))
-                mon.setBackgroundColour(colours.yellow)
-                mon.setCursorPos(gx, comet.y)
-                mon.write("#####")
-                mon.setBackgroundColour(colours.black)
-                if comet.t >= 1 then
-                    comet = nil
-                    drawGrid()
-                end
-            elseif anim then
-                anim.t = anim.t + 0.34
-                if anim.t >= 1 then
-                    c0 = anim.to
-                    anim = nil
-                end
-                drawGrid()
-            else
-                local it = items[sel]
-                if it and tick % 6 == 0 and it.kind ~= nil then
-                    local c = selCol()
-                    local r = selRow()
-                    if c >= c0 and c < c0 + cols and not anim then
-                        local x = 2 + (c - c0) * (CARD_W + GAPX)
-                        local y = cardsY + r * (CARD_H + GAPY) + CARD_H - 1
-                        if x + CARD_W <= MW + 1 then
-                            -- pulse the focused card's ring, not a fat bar
-                            mon.setBackgroundColour(tick % 12 < 6 and colours.red
-                                or colours.white)
-                            mon.setCursorPos(x + 1, y)
-                            mon.write(string.rep(" ", CARD_W - 2))
-                            mon.setCursorPos(x + 1, y - CARD_H + 1)
-                            mon.write(string.rep(" ", CARD_W - 2))
-                            mon.setBackgroundColour(colours.black)
-                        end
-                    end
-                end
-                if tick % 4 == 0 and it and it.kind == "movie"
-                    and #it.label > CARD_W - 5 then
-                    drawGrid()
-                end
-            end
-        elseif ev == "key" then
-            lastEvent = os.clock()
-            local prev = sel
-            if a == keys.right then sel = sel >= n and 1 or sel + 1 end
-            if a == keys.left then sel = sel <= 1 and n or sel - 1 end
-            if a == keys.up and sel - rows >= 1 then sel = sel - rows end
-            if a == keys.down and sel + rows <= n then sel = sel + rows end
-            if sel ~= prev then
-                blip("move")
-                local prow, nrow = (prev - 1) % rows, (sel - 1) % rows
-                local pcol, ncol = selColOf(prev), selCol()
-                if not anim and prow == nrow and math.abs(ncol - pcol) == 1
-                    and pcol >= c0 and pcol < c0 + cols
-                    and ncol >= c0 and ncol < c0 + cols then
-                    comet = {
-                        fx = 2 + (pcol - c0) * (CARD_W + GAPX),
-                        tx = 2 + (ncol - c0) * (CARD_W + GAPX),
-                        y = cardsY + prow * (CARD_H + GAPY) + CARD_H - 1,
-                        t = 0,
-                    }
-                else
-                    ensureVisible()
-                    drawGrid()
-                end
-                drawHero()
-                drawInfoLine()
-            end
-            if a == keys.enter or a == keys.space then
-                if items[sel] then
-                    blip("open")
-                    return items[sel]
-                end
-            end
-            if a == keys.h then helpOverlay(); drawChrome(); drawGrid() end
-            if a == keys.r then return { kind = "_refresh" } end
-        elseif ev == "monitor_touch" then
-            lastEvent = os.clock()
-            local x, y = b, cc
-            if y == 5 and x >= MW - 18 then
-                return { kind = "_refresh" }
-            end
-            if x <= 1 and pages > 1 then
-                c0 = math.max(0, c0 - cols); anim = nil; blip("page"); drawGrid()
-            elseif x >= MW and pages > 1 then
-                c0 = math.min(totalCols - cols, c0 + cols); anim = nil; blip("page"); drawGrid()
-            else
-                local rel = y - cardsY
-                if rel >= 0 then
-                    local r = math.floor(rel / (CARD_H + GAPY))
-                    local within = rel % (CARD_H + GAPY)
-                    if r < rows and within < CARD_H then
-                        local k = math.floor((x - 2) / (CARD_W + GAPX))
-                        local c = c0 + k
-                        local cx = 2 + k * (CARD_W + GAPX)
-                        local idx = c * rows + r + 1
-                        if idx >= 1 and idx <= n and x >= cx and x < cx + CARD_W and x < MW - 1 then
-                            sel = idx
-                            blip("open")
-                            drawCardReal(items[idx], idx, cx,
-                                         cardsY + r * (CARD_H + GAPY), true, true)
-                            sleep(0.09)
-                            return items[idx]
-                        end
-                    end
-                end
-            end
-        elseif ev == "http_success" or ev == "http_failure" then
-            if refreshInflight and tostring(a):find("movies%.txt") then
-                refreshInflight = false
-                local wasOnline = onlineNow
-                if ev == "http_success" then
-                    local body = b.readAll()
-                    b.close()
-                    local list = parseMovieLines(body)
-                    if #list > 0 then
-                        applyMovieList(list)
-                        onlineNow = true
-                        drawStatusChip()
-                        drawGrid()
-                        drawHero()
-                        drawInfoLine()
-                    else
-                        onlineNow = false
-                        drawStatusChip()
-                    end
-                else
-                    onlineNow = false
-                    drawStatusChip()
-                end
-            end
-        end
-    end
-end
-
-local function settingsScreen()
-    local PERIOD = 1.0
-    local pw = math.min(MW - 4, 60)
-    local ph = 16
-    local px = math.max(2, math.floor((MW - pw) / 2))
-    local py = math.max(2, math.floor((MH - ph) / 2))
-
-    mon.setBackgroundColour(colours.black)
-    mon.clear()
-    box(px, py, pw, ph, colours.lightGrey)
-    chip(px + 2, py, " AUDIO SYNC ", colours.yellow, colours.black)
-    mon.setBackgroundColour(colours.black)
-
-    local valueY, railY, noteY, btnY, volY, sfxY, swY =
-        py + 2, py + 4, py + 6, py + 8, py + 10, py + 12, py + 13
-    local rw = pw - 12
-    local railX = px + 4
-    local pendingClick = nil
-    local savedAt = 0
-
-    local function drawValue()
-        local dv = ("%+.1f s  (%+d ms)"):format(DELAY_MS / 1000, DELAY_MS)
-        mon.setTextColour(colours.white)
-        mon.setBackgroundColour(colours.black)
-        mon.setCursorPos(px + math.floor((pw - #dv) / 2), valueY)
-        mon.write(dv .. string.rep(" ", 6))
-        if os.clock() - savedAt < 0.6 then
-            chip(px + pw - 10, valueY, " SAVED ", colours.lime, colours.black)
-        end
-        centre(noteY, "align the click with each bounce", colours.lightBlue)
-    end
-
-    local function drawRail(frac)
-        mon.setBackgroundColour(colours.lightGrey)
-        mon.setCursorPos(railX, railY)
-        mon.write(string.rep(" ", rw))
-        chip(railX + math.floor(rw / 2), railY, " ", colours.black, colours.white)
-        local bx2 = railX + math.min(rw - 1, math.floor(rw * frac))
-        if bx2 - 2 >= railX then
-            chip(bx2 - 2, railY, " ", colours.lightGrey, colours.black)
-        end
-        if bx2 - 1 >= railX then
-            chip(bx2 - 1, railY, " ", colours.grey, colours.black)
-        end
-        chip(bx2, railY, " ", colours.yellow, colours.black)
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local btnW, gapB = 7, 1
-    local defs = {
-        { id = "minus", t = " -0.1s ", bg = colours.lightGrey, fg = colours.white },
-        { id = "plus",  t = " +0.1s ", bg = colours.lightGrey, fg = colours.white },
-        { id = "test",  t = " TEST  ", bg = colours.lime,      fg = colours.black },
-        { id = "reset", t = " RESET ", bg = colours.yellow,    fg = colours.black },
-        { id = "back",  t = " BACK  ", bg = colours.orange,    fg = colours.black },
-    }
-    local rowW = #defs * btnW + (#defs - 1) * gapB
-    local bx0 = px + math.floor((pw - rowW) / 2)
-    for i, d in ipairs(defs) do
-        d.x, d.y, d.w = bx0 + (i - 1) * (btnW + gapB), btnY, btnW
-    end
-
-    local function drawButtons()
-        for _, d in ipairs(defs) do chip(d.x, d.y, d.t, d.bg, d.fg) end
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local vmX = px + 4
-    local barW = 10
-    local volMinus = { x = vmX, y = volY, w = 3 }
-    local volBarX = vmX + 4
-    local volPlus = { x = volBarX + barW + 1, y = volY, w = 3 }
-
-    local function drawVolume()
-        chip(volMinus.x, volY, " - ", colours.lightGrey, colours.white)
-        mon.setTextColour(colours.lightBlue)
-        mon.setCursorPos(volBarX, volY)
-        local filled = math.floor(VOL / 3 * barW + 0.5)
-        for i = 0, barW - 1 do
-            mon.setBackgroundColour(i < filled and colours.cyan or colours.lightGrey)
-            mon.setCursorPos(volBarX + i, volY)
-            mon.write(" ")
-        end
-        chip(volPlus.x, volY, " + ", colours.lightGrey, colours.white)
-        mon.setBackgroundColour(colours.black)
-        mon.setTextColour(colours.lightGrey)
-        mon.setCursorPos(volPlus.x + 4, volY)
-        mon.write(("%3d%%"):format(math.floor(VOL / 3 * 100 + 0.5)))
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local sfxBtn = { x = px + 4, y = sfxY, w = 10 }
-
-    local function drawSfx()
-        chip(sfxBtn.x, sfxY, SFX and " SFX ON  " or " SFX OFF ", 
-             SFX and colours.green or colours.lightGrey, colours.black)
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local function drawSwatches()
-        for i = 1, 16 do
-            mon.setBackgroundColour(THEME[i][1])
-            mon.setCursorPos(px + 4 + (i - 1), swY)
-            mon.write(" ")
-        end
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local function changed()
-        saveSettings()
-        savedAt = os.clock()
-        drawValue()
-    end
-
-    drawValue()
-    drawRail(0)
-    drawButtons()
-    drawVolume()
-    drawSfx()
-    drawSwatches()
-
-    local function hit(r, x, y)
-        return x >= r.x and x < r.x + r.w and y == r.y
-    end
-
-    local function adjust(d)
-        DELAY_MS = math.max(-5000, math.min(5000, DELAY_MS + d))
-        changed()
-        blip("move")
-    end
-
-    local t0 = os.clock()
-    local hitK = 1
-    while true do
-        drawRail((os.clock() - t0) % PERIOD / PERIOD)
-        while os.clock() >= t0 + hitK * PERIOD + DELAY_MS / 1000 do
-            if sp then pcall(sp.playNote, "pling", 1.0, 20) end
-            hitK = hitK + 1
-        end
-        if pendingClick and os.clock() >= pendingClick then
-            if sp then pcall(sp.playNote, "bit", VOL, 16) end
-            pendingClick = nil
-        end
-        drawValue()
-
-        local id = os.startTimer(0.04)
-        local ev, p, tx, ty = os.pullEvent()
-        if ev == "key" then
-            if p == keys.right then adjust(100)
-            elseif p == keys.left then adjust(-100)
-            elseif p == keys.up then VOL = math.min(3, VOL + 0.1); changed(); drawVolume()
-            elseif p == keys.down then VOL = math.max(0, VOL - 0.1); changed(); drawVolume()
-            elseif p == keys.t then pendingClick = os.clock() + DELAY_MS / 1000
-            elseif p == keys.r then DELAY_MS = 0; changed()
-            elseif p == keys.s then SFX = not SFX; changed(); drawSfx()
-            elseif p == keys.enter or p == keys.q or p == keys.backspace then
-                blip("back") return
-            end
-        elseif ev == "monitor_touch" then
-            local hitBtn = nil
-            for _, d in ipairs(defs) do
-                if hit(d, tx, ty) then hitBtn = d.id break end
-            end
-            if hitBtn == "minus" then adjust(-100)
-            elseif hitBtn == "plus" then adjust(100)
-            elseif hitBtn == "test" then pendingClick = os.clock() + DELAY_MS / 1000
-            elseif hitBtn == "reset" then DELAY_MS = 0; changed()
-            elseif hitBtn == "back" then blip("back") return
-            elseif hit(volMinus, tx, ty) then VOL = math.max(0, VOL - 0.1); changed(); drawVolume()
-            elseif hit(volPlus, tx, ty) then VOL = math.min(3, VOL + 0.1); changed(); drawVolume()
-            elseif hit(sfxBtn, tx, ty) then SFX = not SFX; changed(); drawSfx(); blip("move")
-            elseif ty == railY and tx >= railX and tx < railX + rw then
-                local frac = (tx - railX) / (rw - 1)
-                DELAY_MS = math.floor((frac * 2 - 1) * 5000 / 100 + 0.5) * 100
-                DELAY_MS = math.max(-5000, math.min(5000, DELAY_MS))
-                changed()
-            end
-        end
-    end
-end
-
-local function play(NAME)
-    sweepBuffers()
-
-    -- stripe parts across every available disk: each new part lands on
-    -- whichever disk has the most free space AND room for the whole part
-    local partDisk = {}
-    local function pickDisk(est)
-        local best, bestFree, anyBest, anyFree = nil, -1, nil, -1
-        for _, d in ipairs(DISKS) do
-            local f = fs.getFreeSpace(d)
-            if f > anyFree then anyBest, anyFree = d, f end
-            if f >= est + 150000 and f > bestFree then best, bestFree = d, f end
-        end
-        return best, anyBest, anyFree
-    end
-    local function rname(i) return NAME .. ".ccm." .. i end
-    local function pname(i)
-        return (partDisk[i] or DISKS[1]) .. "/" .. rname(i)
-    end
-    local enc = urlencode(NAME)
-
-    print("Fetching " .. NAME .. "...")
-    local res, err = http.get(BASE .. "/" .. enc .. "/" .. enc .. ".meta", nil, true)
-    if not res then error("Meta download failed: " .. tostring(err), 0) end
-    local body = res.readAll()
-    res.close()
-    local mf = fs.open(NAME .. ".meta", "wb")
-    mf.write(body)
-    mf.close()
-
-    mf = fs.open(NAME .. ".meta", "r")
-    local hdr = mf.readLine()
-    mf.close()
-    local w, h, fps, partCount, blk, md = hdr:match("^(%d+) (%d+) (%d+) (%d+) (%d*) (%d*)")
-    w, h, fps, partCount = tonumber(w), tonumber(h), tonumber(fps), tonumber(partCount)
-    if not w then error("Corrupt meta file", 0) end
-    local nb = tonumber(blk) or 1
-    local MODE = tonumber(md) or 0
-    if MODE > 3 then
-        error("movie needs render mode " .. MODE .. ", this player supports 0-3", 0)
-    end
-    local HALF = MODE == 1
-    local PIXEL = MODE == 3 and GFX
-    local cw, chh
-    if MODE == 3 then
-        cw, chh = w, h
-    else
-        cw, chh = w * nb, h * nb
-    end
-    local lastPart = partCount - 1
-
-    mon.setTextScale(0.5)
-    MW, MH = mon.getSize()
-
-    -- scale the buffer to all available storage (root + floppies), keeping a
-    -- small safety margin; PLAY_AHEAD stays one part below MAX_BUF so
-    -- downloads finish instead of being aborted at the ceiling
-    MAX_BUF = math.max(MAX_BUF, totalFree() - 3000000)
-    PLAY_AHEAD = math.max(PLAY_AHEAD, MAX_BUF - 1200000)
-    PREFILL = math.max(PART_LOW, math.floor(MAX_BUF * 0.6))
-
-    if PIXEL then
-        GFX_W, GFX_H = cw * 6, chh * 9
-    else
-        if GFX then pcall(mon.setGraphicsMode, 0) end
-        if math.floor(MW + 0.5) < cw or math.floor(MH + 0.5) < chh then
-            print(("monitor %dx%d too small for %dx%d grid"):format(MW, MH, cw, chh))
-        end
-    end
-
-    local win = PIXEL and nil or window.create(mon, 1, 1, cw, chh, false)
-
-    local pixelBuf = PIXEL and {} or nil
-    local pixelExpected = PIXEL and (cw * chh) or 0
-    local pixelFc = -1
-    local gfxActive = false
-    local gfxOx, gfxOy = 0, 0
-    local rgbToIdx = nil
-    local function initGfx()
-        if gfxActive then return end
-        mon.setGraphicsMode(2)
-        gfxActive = true
-        -- the monitor's true pixel size can differ slightly from the
-        -- transcoded grid: centre the frame so it doesn't hug the top-left
-        gfxOx, gfxOy = 0, 0
-        local okS, spw, sph = pcall(mon.getSize, 2)
-        if okS and type(spw) == "number" and spw > 0 and type(sph) == "number" and sph > 0 then
-            gfxOx = math.max(0, math.floor((spw - cw) / 2))
-            gfxOy = math.max(0, math.floor((sph - chh) / 2))
-        end
-        for ri = 0, 5 do
-            for gi = 0, 5 do
-                for bi = 0, 5 do
-                    local idx = ri * 36 + gi * 6 + bi
-                    pcall(mon.setPaletteColour, idx, ri / 5, gi / 5, bi / 5)
-                end
-            end
-        end
-        for i = 0, 39 do
-            local v = i / 39
-            pcall(mon.setPaletteColour, 216 + i, v, v, v)
-        end
-    end
-
-    local function toHex(v)
-        if v < 10 then return string.char(48 + v) end
-        return string.char(87 + v)
-    end
-
-    local MAXDL = 8
-    local nextPart = 0
-    local dls = {}
-    local lastDlFail = 0
-    local lastGc = 0
-    local lastPartSz = 0
-
-    local bufCache, bufAt = 0, 0
-    local function bufferedAhead(ttlArg)
-        -- walking every part with fs.getSize is expensive: serve a cached
-        -- value and only re-walk the filesystem once per ttl seconds
-        local ttl = ttlArg or 1
-        local now = os.clock()
-        if now - bufAt < ttl then return bufCache end
-        local total = 0
-        for i = 0, nextPart - 1 do
-            local f = pname(i)
-            if fs.exists(f) then
-                total = total + fs.getSize(f)
-            else
-                f = f .. ".part"
-                if fs.exists(f) then total = total + fs.getSize(f) end
-            end
-        end
-        bufCache, bufAt = total, now
-        return total
-    end
-
-    local start = nil
-    local fi, ai = 0, 0
-    local frameDur = 1000 / fps
-    local pendingAudio = {}
-    local cachedFrame
-    local cachedGlyphs
-    local curPart = 0
-    local hnd = nil
-    local paused = false
-    local pausedAt = nil
-    local abortPlay = false
-
-    local function closeDl()
-        for _, d in ipairs(dls) do
-            pcall(function() d.fh.close() end)
-            pcall(function() d.res.close() end)
-            pcall(fs.delete, d.tmp)
-        end
-        dls = {}
-    end
-
-    local lastUiDraw = 0
-    local uiEnabled = true
-    local uiBuilt = false
-    local SPIN = { "|", "/", "-", "\\" }
-    local speedT0 = os.clock()
-    local speedB0 = 0
-    local LW = math.min(MW - 4, 56)
-    local LH = 15
-    local LX = math.max(2, math.floor((MW - LW) / 2))
-    local LY = math.max(2, math.floor((MH - LH) / 2))
-    local LBX, LBW = LX + 3, LW - 6
-    local cancelRect = { x = LX + LW - 9, y = LY, w = 8 }
-
-    local function buildLoading()
-        mon.setBackgroundColour(colours.black)
-        mon.clear()
-        box(LX, LY, LW, LH, colours.lightGrey)
-        chip(LX + 2, LY, " NOW LOADING ", colours.lime, colours.black)
-        chip(cancelRect.x, LY, " CANCEL ", colours.red, colours.white)
-        mon.setBackgroundColour(colours.black)
-        local title = #NAME > LBW and NAME:sub(1, LBW) or NAME
-        mon.setTextColour(colours.white)
-        mon.setCursorPos(LBX, LY + 2)
-        mon.write(title)
-        mon.setBackgroundColour(colours.lightGrey)
-        mon.setCursorPos(LBX + 1, LY + 5)
-        mon.write(string.rep(" ", LBW - 2))
-        mon.setBackgroundColour(colours.black)
-        mon.setTextColour(colours.lightGrey)
-        mon.setCursorPos(LBX + 1, LY + 5)
-        mon.write("[")
-        mon.setCursorPos(LBX + LBW - 2, LY + 5)
-        mon.write("]")
-        uiBuilt = true
-    end
-
-    local function uiStatus(sub)
-        if not uiEnabled then return end
-        local ok = pcall(function()
-            if not uiBuilt then buildLoading() end
-            local b = bufferedAhead()
-            local frac = math.min(1, b / PREFILL)
-            local pctStr = tostring(math.floor(frac * 100 + 0.5)) .. "%"
-            local pctCol = math.floor(os.clock() * 3) % 2 == 0 and colours.lime or colours.cyan
-            mon.setTextColour(pctCol)
-            mon.setBackgroundColour(colours.black)
-            mon.setCursorPos(LBX, LY + 4)
-            mon.write(pctStr .. string.rep(" ", 8 - #pctStr))
-            mon.setBackgroundColour(colours.lightGrey)
-            mon.setCursorPos(LBX + 1, LY + 5)
-            mon.write(string.rep(" ", LBW - 2))
-            local fill = math.min(LBW - 4, math.floor((LBW - 4) * frac + 0.5))
-            if fill > 0 then
-                mon.setBackgroundColour(colours.lime)
-                mon.setCursorPos(LBX + 2, LY + 5)
-                mon.write(string.rep(" ", fill))
-                local shineX = LBX + 2 + (math.floor(os.clock() * 8) % math.max(1, fill))
-                if shineX + 1 <= LBX + LBW - 3 then
-                    mon.setBackgroundColour(colours.green)
-                    mon.setCursorPos(shineX, LY + 5)
-                    mon.write("  ")
-                end
-            end
-            mon.setBackgroundColour(colours.black)
-            local el = os.clock() - speedT0
-            local rate = el > 0.5 and (b - speedB0) / el or 0
-            local stats
-            if rate > 1 then
-                local eta = math.min(999, math.ceil((PREFILL - b) / rate))
-                stats = ("%.1f/%.1fMB  %.1fMB/s  ETA %ds")
-                    :format(b / 1000000, PREFILL / 1000000, rate / 1000000, eta)
-            else
-                stats = ("%.1f/%.1fMB"):format(b / 1000000, PREFILL / 1000000)
-            end
-            if #stats > LBW - 2 then stats = stats:sub(1, LBW - 2) end
-            mon.setTextColour(colours.lightBlue)
-            mon.setCursorPos(LBX + 1, LY + 7)
-            mon.write(stats .. string.rep(" ", LBW - 1 - #stats))
-            local meta = ("part %d/%d   disk %dMB free")
-                :format(math.min(nextPart, lastPart + 1), lastPart + 1,
-                        math.floor(fs.getFreeSpace("") / 1000000))
-            if #meta > LBW - 2 then meta = meta:sub(1, LBW - 2) end
-            mon.setTextColour(colours.lightGrey)
-            mon.setCursorPos(LBX + 1, LY + 9)
-            mon.write(meta .. string.rep(" ", LBW - 1 - #meta))
-            local line = ((sub or "loading") .. " " .. SPIN[math.floor(os.clock() * 2) % 4 + 1])
-            if #line > LBW - 2 then line = line:sub(1, LBW - 2) end
-            mon.setTextColour(colours.cyan)
-            mon.setCursorPos(LBX + 1, LY + 11)
-            mon.write(line .. string.rep(" ", LBW - 1 - #line))
-        end)
-        if not ok then uiEnabled = false end
-    end
-
-    local function uiStatusThrottled(sub)
-        local now = os.clock()
-        if now - lastUiDraw >= 0.25 then
-            lastUiDraw = now
-            uiStatus(sub)
-        end
-    end
-
-    local function pump(target)
-        -- NOTE: never force an exact bufferedAhead() recount here - walking
-        -- fs.getSize over every part stalls the whole computer; the 0.25s
-        -- cached value is plenty accurate now that this runs in its own
-        -- thread away from rendering
-        local k = 1
-        while k <= #dls do
-            local d = dls[k]
-            local piece = d.res.read(65536)
-            if piece then
-                local okW, werr = pcall(d.fh.write, piece)
-                if okW then
-                    k = k + 1
-                else
-                    -- target disk filled mid-download: abandon this part
-                    -- cleanly and retry it on another disk later
-                    print("[dbg] WRITE FAIL part " .. d.idx .. ": " .. tostring(werr))
-                    pcall(function() d.fh.close() end)
-                    pcall(function() d.res.close() end)
-                    pcall(fs.delete, d.tmp)
-                    partDisk[d.idx] = nil
-                    nextPart = d.idx
-                    lastDlFail = os.clock()
-                    table.remove(dls, k)
-                end
-            else
-                d.fh.close()
-                d.res.close()
-                if fs.exists(d.tmp) then
-                    pcall(fs.move, d.tmp, pname(d.idx))
-                    local okSz, sz = pcall(fs.getSize, pname(d.idx))
-                    if okSz and type(sz) == "number" then
-                        lastPartSz = sz
-                        dbg(("part %d complete (%.2f MB on %s)")
-                            :format(d.idx, sz / 1000000, pname(d.idx)))
-                    end
-                end
-                table.remove(dls, k)
-            end
-        end
-        -- failed requests retry at most twice a second: sleeping here would
-        -- freeze the render loop and drop frames
-        -- hard ceiling: abort newest in-flight downloads while over MAX_BUF
-        -- (finished parts + .part files both count toward bufferedAhead())
-        bufAt = 0
-        bufAt = 0
-        -- garbage collection: delete every part behind the playhead from
-        -- every disk, so consumed footage ALWAYS frees space for new
-        -- downloads (the per-part delete in nextRecord can miss)
-        local nowC = os.clock()
-        if nowC - lastGc > 3 then
-            lastGc = nowC
-            local removed = 0
-            for _, dsk in ipairs(DISKS) do
-                for _, f in ipairs(fs.list(dsk)) do
-                    local num = f:match("%.ccm%.(%d+)$")
-                    if num and tonumber(num) < curPart then
-                        fs.delete(fs.combine(dsk, f))
-                        removed = removed + 1
-                    end
-                end
-            end
-            if removed > 0 then
-                bufAt = 0
-                dbg(("gc: freed %d played part(s)"):format(removed))
-            end
-        end
-        while #dls > 0 and bufferedAhead() >= MAX_BUF do
-            local d = table.remove(dls)
-            pcall(function() d.res.close() end)
-            pcall(function() d.fh.close() end)
-            pcall(fs.delete, d.tmp)
-            nextPart = d.idx          -- re-request this part once below the cap
-        end
-        -- headroom check: never START a download unless the finished part
-        -- will still fit under MAX_BUF - aborted partials are pure waste,
-        -- so it's far better to wait than to start one that gets killed
-        local est = lastPartSz > 0 and lastPartSz or 1000000
-        local b = bufferedAhead()
-        if #dls < MAXDL and nextPart <= lastPart then
-            local why
-            if b + est > MAX_BUF then
-                why = ("headroom wait: buf %.2f + est %.2f > cap %.2f MB")
-                    :format(b / 1e6, est / 1e6, MAX_BUF / 1e6)
-            elseif b >= math.min(target, MAX_BUF) then
-                why = ("target reached: buf %.2f MB"):format(b / 1e6)
-            else
-                local tgt, anyBest, anyFree = pickDisk(est)
-                if not tgt then
-                    why = ("no disk room: need %.2f MB, fullest '%s' has %.2f MB")
-                        :format((est + 150000) / 1e6,
-                            anyBest == "" and "<root>" or anyBest, anyFree / 1e6)
-                elseif os.clock() - lastDlFail <= 0.5 then
-                    why = "retry cooldown"
-                end
-            end
-            if why then dbg(why) end
-        end
-        if #dls < MAXDL and nextPart <= lastPart
-             and b + est <= MAX_BUF
-             and b < math.min(target, MAX_BUF)
-             and os.clock() - lastDlFail > 0.5 then
-            local tgt = pickDisk(est)
-            if not tgt then return end
-            partDisk[nextPart] = tgt
-            dbg(("GET %s -> %s"):format(rname(nextPart), tgt))
-            local res2, err2 = http.get(BASE .. "/" .. enc .. "/" .. urlencode(rname(nextPart)), nil, true)
-            if not res2 then
-                lastDlFail = os.clock()
-                print("[dbg] HTTP FAIL part " .. nextPart .. ": " .. tostring(err2))
-                return
-            end
-            local tmp = pname(nextPart) .. ".part"
-            local fh = fs.open(tmp, "wb")
-            dls[#dls + 1] = { idx = nextPart, res = res2, fh = fh, tmp = tmp }
-            nextPart = nextPart + 1
-        end
-    end
-
-    -- downloader thread: owns ALL http/disk work so rendering never blocks
-    local function downloader()
-        while not abortPlay do
-            pump(PLAY_AHEAD)
-            if nextPart > lastPart and #dls == 0 then break end
-            sleep(0.05)
-        end
-    end
-
-    local HALF_GLYPH = string.char(143)
-    local halfRowText = nil
-    local SHADE_CHARS = {}
-    do
-        local set = " /(\219\177\127@"
-        for i = 1, #set do SHADE_CHARS[tostring(i - 1)] = set:sub(i, i) end
-    end
-
-    local renderMs, fpsT, fpsN = 0, os.clock(), 0
-    local function render(frame, glyphs)
-        if PIXEL then
-            initGfx()
-            local t0 = os.clock()
-            -- frames arrive pre-quantised (1 palette index per pixel):
-            -- slicing into rows is all that's left to do per frame
-            local rows = {}
-            if type(frame) == "string" then
-                for y = 1, chh do
-                    rows[y] = frame:sub((y - 1) * cw + 1, y * cw)
-                end
-            end
-            pcall(function() mon.setFrozen(true) end)
-            mon.drawPixels(gfxOx, gfxOy, rows)
-            pcall(function() mon.setFrozen(false) end)
-            renderMs = renderMs == 0 and (os.clock() - t0) * 1000
-                or renderMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
-            return
-        end
-        local y = 1
-        for r0 in string.gmatch(frame, "[^;]+") do
-            if y > chh then break end
-            win.setCursorPos(1, y)
-            local r = r0
-            if MODE == 2 then
-                local n3 = #r
-                if n3 >= cw * 3 then
-                    r = r:sub(1, cw * 3)
-                elseif n3 > 0 then
-                    r = r .. r:sub(-1):rep(cw * 3 - n3)
-                else
-                    r = string.rep("ff0", cw)
-                end
-                local colours = r:sub(1, cw * 2)
-                local gdig = glyphs and glyphs:sub((y - 1) * cw + 1, y * cw)
-                if not gdig or #gdig < cw then
-                    gdig = string.rep("0", cw)
-                end
-                local fg = (colours:gsub("(.)(.)", "%1"))
-                local bg = (colours:gsub("(.)(.)", "%2"))
-                local txt = (gdig:gsub("%x", SHADE_CHARS))
-                win.blit(txt, fg, bg)
-            elseif HALF then
-                local n2 = #r
-                if n2 >= cw * 2 then
-                    r = r:sub(1, cw * 2)
-                elseif n2 > 0 then
-                    r = r .. r:sub(-1):rep(cw * 2 - n2)
-                else
-                    r = string.rep("f", cw * 2)
-                end
-                local top = r:sub(1, cw)
-                local bot = r:sub(cw + 1, cw * 2)
-                if not halfRowText then halfRowText = HALF_GLYPH:rep(cw) end
-                win.blit(halfRowText, top, bot)
-            else
-                local n2 = #r
-                if n2 >= cw then
-                    r = r:sub(1, cw)
-                    win.blit(string.rep(" ", cw), r, r)
-                elseif n2 > 0 then
-                    local pad = r:sub(-1):rep(cw - n2)
-                    win.blit(string.rep(" ", cw), r .. pad, r .. pad)
-                end
-            end
-            y = y + 1
-        end
-        win.setVisible(true)
-    end
-
-    local palCur, palTgt = {}, {}
-    local function applyPalette(p)
-        if not p then return end
-        local i = 0
-        for entry in p:gmatch("[^;]+") do
-            local r, g, b = entry:match("(%d+),(%d+),(%d+)")
-            if r and i < 16 then
-                i = i + 1
-                palTgt[i] = { r / 255, g / 255, b / 255 }
-                -- first palette snaps instantly; later ones ease in so a
-                -- palette change repaints as a smooth shift instead of a
-                -- one-frame full-screen colour flash
-                if not palCur[i] then palCur[i] = { r / 255, g / 255, b / 255 } end
-            end
-        end
-    end
-
-    local PAL_EASE = 0.7
-    local function stepPalette()
-        local dirty = false
-        for i = 1, 16 do
-            local c, t = palCur[i], palTgt[i]
-            if c and t then
-                for ch = 1, 3 do
-                    local d = t[ch] - c[ch]
-                    if d > 0.004 or d < -0.004 then
-                        c[ch] = c[ch] + d * PAL_EASE
-                        dirty = true
-                    else
-                        c[ch] = t[ch]
-                    end
-                end
-            end
-        end
-        if dirty then
-            for i = 1, 16 do
-                local c = palCur[i]
-                if c then pcall(mon.setPaletteColour, 2 ^ (i - 1), c[1], c[2], c[3]) end
-            end
-        end
-    end
-
-    local function assemble(digits)
-        local rowW = cw * (MODE >= 1 and 2 or 1)
-        local rows = {}
-        local pos = 1
-        for _ = 1, chh do
-            rows[#rows + 1] = digits:sub(pos, pos + rowW - 1)
-            pos = pos + rowW
-        end
-        return table.concat(rows, ";")
-    end
-
-    local function assembleGlyphs(digits)
-        if not digits then return nil end
-        local rows = {}
-        local pos = 1
-        for _ = 1, chh do
-            rows[#rows + 1] = digits:sub(pos, pos + cw - 1)
-            pos = pos + cw
-        end
-        return table.concat(rows, ";")
-    end
-
-    local function unpackDigits(p, rle)
-        local cells = {}
-        local ci = 0
-        if rle then
-            for i = 1, #p, 2 do
-                local cnt = string.byte(p, i)
-                local v = toHex(string.byte(p, i + 1))
-                for _ = 1, cnt do
-                    ci = ci + 1
-                    cells[ci] = v
-                end
-            end
-        else
-            for i = 1, #p do
-                local b = string.byte(p, i)
-                ci = ci + 1; cells[ci] = toHex(math.floor(b / 16))
-                ci = ci + 1; cells[ci] = toHex(b % 16)
-            end
-        end
-        return table.concat(cells)
-    end
-
-    local function decodePacked(p)
-        return assemble(unpackDigits(p, false))
-    end
-
-    local function decodeRLE(p)
-        return assemble(unpackDigits(p, true))
-    end
-
-    local function playAudioChunk(p)
-        if not sp then return end
-        local tt = {}
-        local idx = 0
-        for i = 1, #p do
-            local b = string.byte(p, i)
-            for j = 7, 0, -1 do
-                idx = idx + 1
-                tt[idx] = (b % (2 ^ (j + 1)) >= 2 ^ j) and 127 or -128
-            end
-        end
-        while not sp.playAudio(tt, VOL) do
-            os.pullEvent("speaker_audio_empty")
-        end
-    end
-
-    local resumeRect, menuRect
-    local eqRect = nil
-    local eqTick = 0
-
-    local function drawEQ(k)
-        if not eqRect then return end
-        local hs = { 1, 3, 5, 4, 2 }
-        for i = 0, 2 do
-            local hgt = hs[((k + i * 2) % 5) + 1]
-            for r = 0, 4 do
-                mon.setBackgroundColour(r < hgt and colours.lime or colours.grey)
-                mon.setCursorPos(eqRect.x + i * 2, eqRect.y + 4 - r)
-                mon.write(" ")
-            end
-        end
-        mon.setBackgroundColour(colours.black)
-    end
-
-    local function inRect(r, x, y)
-        return r ~= nil and y == r.y and x >= r.x and x < r.x + r.w
-    end
-
-    local function drawPauseBar(on)
-        if on then
-            mon.setBackgroundColour(colours.grey)
-            mon.clearLine()
-            mon.setCursorPos(1, MH)
-            mon.write(string.rep(" ", MW))
-            chip(1, MH, " II PAUSED ", colours.red, colours.white)
-            mon.setBackgroundColour(colours.grey)
-            mon.setTextColour(colours.lightBlue)
-            mon.setCursorPos(13, MH)
-            if MW >= 44 then
-                local menuW, resumeW = 8, 10
-                local menuX = MW - menuW + 1
-                local resumeX = menuX - resumeW - 1
-                mon.write("SPACE / tap")
-                chip(resumeX, MH, "  RESUME  ", colours.lime, colours.black)
-                chip(menuX, MH, "  MENU  ", colours.orange, colours.black)
-                resumeRect = { x = resumeX, y = MH, w = resumeW }
-                menuRect = { x = menuX, y = MH, w = menuW }
-            else
-                mon.write("SPACE resume   Q menu")
-                resumeRect, menuRect = nil, nil
-            end
-            mon.setBackgroundColour(colours.black)
-            local ww = wordWidth("PAUSED")
-            local bw = ww + 8
-            if MW > bw + 2 then
-                local bx = math.floor((MW - bw) / 2) + 1
-                local by = math.floor(MH / 2) - 3
-                mon.setBackgroundColour(colours.black)
-                for r = 0, 6 do
-                    mon.setCursorPos(bx, by + r)
-                    mon.write(string.rep(" ", bw))
-                end
-                drawWord("PAUSED", bx + 4, by + 1, colours.red)
-                centre(by + 6, "tap anywhere to resume", colours.lightBlue)
-                if bw >= ww + 12 then
-                    eqRect = { x = bx + bw - 7, y = by + 1 }
-                    drawEQ(0)
-                else
-                    eqRect = nil
-                end
-            end
-            local frac = curPart / (lastPart + 1)
-            mon.setBackgroundColour(colours.lightGrey)
-            mon.setCursorPos(1, MH - 1)
-            mon.write(string.rep(" ", MW))
-            local pf = math.floor(MW * frac + 0.5)
-            if pf > 0 then
-                mon.setBackgroundColour(colours.red)
-                mon.setCursorPos(1, MH - 1)
-                mon.write(string.rep(" ", pf))
-            end
-            mon.setBackgroundColour(colours.black)
-            local secs = math.floor(bufferedAhead() / 36000)
-            centre(MH - 3, ("buffered ~%ds ahead"):format(secs), colours.lightBlue)
-        else
-            resumeRect, menuRect = nil, nil
-            mon.setBackgroundColour(colours.black)
-            mon.setCursorPos(1, MH - 1)
-            mon.write(string.rep(" ", MW))
-            mon.setCursorPos(1, MH)
-            mon.write(string.rep(" ", MW))
-        end
-    end
-
-    local function setPaused(v)
-        if v == paused or not start then return end
-        paused = v
-        if paused then
-            pausedAt = os.epoch("utc")
-            drawPauseBar(true)
-        else
-            start = start + (os.epoch("utc") - pausedAt)
-            drawPauseBar(false)
-            if cachedFrame then render(cachedFrame, cachedGlyphs) end
-        end
-    end
-
-    local function handlePlayKey(p1)
-        if p1 == keys.space or p1 == keys.p then
-            setPaused(not paused)
-        elseif p1 == keys.q or p1 == keys.backspace then
-            abortPlay = true
-        end
-    end
-
-    local function handleTouch(x, y)
-        if not start then
-            if inRect(cancelRect, x, y) then abortPlay = true end
-            return
-        end
-        if paused then
-            if inRect(menuRect, x, y) then
-                abortPlay = true
-            else
-                setPaused(false)
-            end
-        else
-            setPaused(true)
-        end
-    end
-
-    local function waitEvents(t)
-        local id = os.startTimer(t)
-        local ev, a, b, c = os.pullEvent()
-        if ev == "key" then
-            handlePlayKey(a)
-        elseif ev == "monitor_touch" then
-            handleTouch(b, c)
-        end
-    end
-
-    local function cleanup()
-        closeDl()
-        if hnd then pcall(function() hnd.close() end) hnd = nil end
-        if sp then pcall(sp.stop) end
-        -- sweep any leftover parts/meta buffers: on a small disk they would
-        -- otherwise starve the next playback's buffering
-        sweepBuffers()
-    end
-
-    -- player thread: decode/render only, NEVER touches http or disk writes
-    local function playerLoop()
-    -- start as soon as the FIRST part is on disk - no need to wait for a
-    -- huge prefill (which the download headroom rules may never reach)
-    local t0buf = os.clock()
-    while not abortPlay and not fs.exists(pname(curPart)) do
-        uiStatusThrottled("downloading")
-        if os.clock() - t0buf > 60 then break end
-        waitEvents(0.05)
-    end
-    speedT0 = os.clock()
-    speedB0 = bufferedAhead()
-    if abortPlay then return end
-
-    local function nextRecord()
-        while true do
-            if not hnd then
-                while not abortPlay and not fs.exists(pname(curPart)) do
-                    uiStatusThrottled("rebuffering")
-                    waitEvents(0.05)
-                end
-                if abortPlay then return nil end
-                hnd = fs.open(pname(curPart), "rb")
-                if curPart > 0 and fs.exists(pname(curPart - 1)) then
-                    fs.delete(pname(curPart - 1))
-                end
-            end
-            local t = hnd.read()
-            if t then
-                local b2, b3 = hnd.read(), hnd.read()
-                local len = b2 * 256 + b3
-                local payload = ""
-                if len > 0 then
-                    payload = hnd.read(len)
-                    if not payload then error("truncated part " .. curPart, 0) end
-                end
-                return t, payload
-            end
-            hnd.close()
-            hnd = nil
-            if curPart >= lastPart then return nil end
-            curPart = curPart + 1
-        end
-    end
-
-    local lastIter = os.clock()
-    while not abortPlay do
-        local t, payload = nextRecord()
-        if abortPlay or not t then break end
-
-        if t == 1 then
-            applyPalette(payload)
-        elseif t == 4 then
-            if sp then pendingAudio[#pendingAudio + 1] = payload end
-        elseif t == 6 then
-            if PIXEL then
-                local header = string.byte(payload, 1) or 0
-                local fc = math.floor(header / 16) % 16
-                local chunk_idx = header % 16
-                if fc ~= pixelFc then
-                    pixelBuf = {}
-                    pixelFc = fc
-                end
-                pixelBuf[chunk_idx + 1] = payload:sub(2)
-                local total = 0
-                for i = 1, #pixelBuf do total = total + #pixelBuf[i] end
-                if total >= pixelExpected then
-                    cachedFrame = table.concat(pixelBuf)
-                    pixelBuf = {}
-                    if not start then start = os.epoch("utc") + 150 end
-                    while not abortPlay do
-                        if not paused and os.epoch("utc") >= start + fi * frameDur then break end
-                        waitEvents(paused and 0.15 or 0.02)
-                        if paused then
-                            eqTick = eqTick + 1
-                            drawEQ(eqTick)
-                        end
-                    end
-                    if abortPlay then break end
-                    if not paused then
-                        stepPalette()
-                        render(cachedFrame, nil)
-                        fi = fi + 1
-                    else
-                        stepPalette()
-                    end
-                end
-            end
-        elseif t == 0 or t == 2 or t == 3 then
-            if t ~= 0 then
-                cachedFrame = (t == 3) and decodeRLE(payload) or decodePacked(payload)
-                if MODE == 2 then
-                    local g5, g5payload = nextRecord()
-                    if g5 == 5 and not abortPlay then
-                        local sub = g5payload:byte(1)
-                        local body = g5payload:sub(2)
-                        cachedGlyphs = assembleGlyphs(
-                            unpackDigits(body, sub == 3))
-                    end
-                end
-            end
-            if not start then start = os.epoch("utc") + 150 end
-            while not abortPlay do
-                if not paused and os.epoch("utc") >= start + fi * frameDur then break end
-                waitEvents(paused and 0.15 or 0.02)
-                if paused then
-                    eqTick = eqTick + 1
-                    drawEQ(eqTick)
-                end
-            end
-            if abortPlay then break end
-            if not paused then
-                stepPalette()
-                render(cachedFrame, cachedGlyphs)
-                fi = fi + 1
-            else
-                stepPalette()
-            end
-        end
-
-        while #pendingAudio > 0 and sp and start and not paused do
-            local due = start + ai * 250 + DELAY_MS
-            if os.epoch("utc") < due - 120 then break end
-            if due > start + fi * frameDur + 120 then break end
-            playAudioChunk(table.remove(pendingAudio, 1))
-            ai = ai + 1
-        end
-
-        local nowC = os.clock()
-        fpsN = fpsN + 1
-        if nowC - fpsT > 1 then
-            dbg(("render %.1f ms/frame | %.1f fps | buffer %.1f MB")
-                :format(renderMs, fpsN / (nowC - fpsT), bufferedAhead(2) / 1e6))
-            fpsT, fpsN = nowC, 0
-        end
-        if nowC - lastIter < 0.004 then sleep(0.005) end
-        lastIter = nowC
-    end
-    end
-
-    parallel.waitForAny(playerLoop, downloader)
-
-    cleanup()
-    if PIXEL then
-        pcall(mon.setGraphicsMode, 0)
-    elseif win then
-        win.setVisible(false)
-    end
-    mon.setBackgroundColour(colours.black)
-    mon.clear()
-end
-
-local argName = ...
-if argName and #argName > 0 then
-    play(argName)
-    resetPalette()
-    applyTheme()
-    term.clear()
-    term.setCursorPos(1, 1)
-    return
-end
-
-if MW >= 32 then
-    mon.setBackgroundColour(colours.black)
-    mon.clear()
-    blip("jingle")
-    local ly = math.floor(MH / 2) - 2
-    for _, x in ipairs({ 30, 22, 15, 9, 4, 2 }) do
-        mon.setBackgroundColour(colours.black)
-        mon.clear()
-        drawLogo(math.max(2, math.floor(x)), ly)
-        local sh = math.floor((x * 7) % (MW - 8)) + 2
-        mon.setBackgroundColour(colours.cyan)
-        mon.setCursorPos(sh, ly + 6)
-        mon.write("      ")
-        mon.setBackgroundColour(colours.black)
-        sleep(0.06)
-    end
-    sleep(0.25)
-end
-
-local bootScale = 0.5
-pcall(function() bootScale = mon.getTextScale() end)
-local movies, online = fetchMovies()
-while true do
-    local it = homeMenu(movies, online)
-    while it.kind == "_refresh" do
-        blinds()
-        movies, online = fetchMovies()
-        showToast(online and "Library refreshed" or "Offline - cached list")
-        it = homeMenu(movies, online)
-    end
-    if it.kind == "settings" then
-        blinds()
-        settingsScreen()
-        movies, online = fetchMovies()
-    else
-        markSeen(it.label)
-        blinds()
-        play(it.label)
-        resetPalette()
-        applyTheme()
-        pcall(function() mon.setTextScale(bootScale) end)
-        MW, MH = mon.getSize()
-        movies, online = fetchMovies()
-    end
+local ok, err = pcall(main)
+if not ok then
+    crashCard(err)
 end
