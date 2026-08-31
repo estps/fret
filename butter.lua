@@ -49,6 +49,11 @@ local CFG = {
 	rate       = 10,   -- loop rate Hz
 	bearingGain= 1.5,  -- bank demand per radian of heading error
 	cruiseSpeed= 32,   -- target cruise speed m/s
+
+	-- Phase thresholds (one task at a time)
+	altBand     = 2,   -- blocks of cruise-alt error considered "reached"
+	flareHeight = 10,  -- below this on descent, flare the landing
+	touchdown   = 0.5, -- below this altitude, consider it landed
 }
 
 -- =========================================================
@@ -121,63 +126,112 @@ local testMode = (arg and arg[1] == "test")
 print("autopilot online. cruiseAlt=" .. CFG.cruiseAlt .. " thrust=" .. CFG.thrust)
 
 local dt = 1 / CFG.rate
+
+-- Phase state machine: one task at a time.
+--   "climb"   -> climb to cruise altitude first (on its own)
+--   "cruise"  -> hold cruise altitude while flying to the target
+--   "descend" -> descend to landing altitude, aligned with target
+--   "flare"   -> raise the nose to butter the touchdown
+--   "land"    -> touchdown, cut thrust
+local phase = "climb"
+
 while true do
 	-- read sensors (nil-safe)
 	local height  = alt.getHeight() or 0
 	local sink    = alt.getVerticalSpeed() or 0
 	local bearing = nav.getBearingRad() or 0
 	local dist    = nav.getDistanceToTarget() or 100
-	local _, roll = imu.getAngles()
-	roll  = roll or 0
-	local spd = vel.getVelocity() or 0
-
-	local cruising = dist > CFG.landGate
 
 	updateBank(bearing, dt)
 
-	-- -------- PITCH (altitude hold) --------
-	local targetAlt = cruising and CFG.cruiseAlt or CFG.descendTo
-	local altErr = targetAlt - height
-	if math.abs(altErr) <= CFG.deadband then altErr = 0 end
+	-- climb straight, then cruise (bank), then descend, then flare, then land
+	if phase == "climb" then
+		-- TASK 1: get to cruise altitude (straight up, no roll)
+		local altErr = CFG.cruiseAlt - height
+		local pitch = (altErr * CFG.pGain) - (sink * CFG.dampSign * CFG.dGain)
+		local pitchCmd = clamp(pitch, -1, 1) * (CFG.maxPitch * 0.5) * CFG.pitchSign
+		lY  = slew(lY,  pitchCmd, dt)
+		rYv = slew(rYv, pitchCmd, dt)
+		if not testMode then
+			parallel.waitForAll(
+				function() L.setVectorY(lY)  L.setThrust(CFG.thrust) end,
+				function() R.setVectorY(rYv) R.setThrust(CFG.thrust) end
+			)
+		end
+		if math.abs(altErr) <= CFG.altBand then
+			phase = "cruise"
+			print("phase: cruise  (cruise altitude reached)")
+		end
 
-	-- PD controller: proportional on altitude error + damping on vertical speed
-	local pitch = (altErr * CFG.pGain) - (sink * CFG.dampSign * CFG.dGain)
+	elseif phase == "cruise" then
+		-- TASK 2: hold cruise altitude AND bank toward the target
+		local altErr = CFG.cruiseAlt - height
+		local pitch = (altErr * CFG.pGain) - (sink * CFG.dampSign * CFG.dGain)
+		local pitchCmd = clamp(pitch, -1, 1) * (CFG.maxPitch * 0.5) * CFG.pitchSign
+		local rollCmd  = updateBank(bearing, dt) * CFG.rollSign
+		local tLy = clamp(pitchCmd + rollCmd, -CFG.maxPitch, CFG.maxPitch)
+		local tRy = clamp(pitchCmd - rollCmd, -CFG.maxPitch, CFG.maxPitch)
+		lY  = slew(lY,  tLy, dt)
+		rYv = slew(rYv, tRy, dt)
+		if not testMode then
+			parallel.waitForAll(
+				function() L.setVectorY(lY)  L.setThrust(CFG.thrust) end,
+				function() R.setVectorY(rYv) R.setThrust(CFG.thrust) end
+			)
+		end
+		if dist <= CFG.landGate then
+			phase = "descend"
+			print("phase: descend  (target reached, descending to land)")
+		end
 
-	-- flare at landing: gently raise the nose as we get low
-	if not cruising and height <= 10 and height > 0 then
-		local flare = clamp((10 - height) / 10, 0, 1)
-		pitch = (pitch * (1 - flare)) + (CFG.dampSign * flare * 0.6)
-	end
+	elseif phase == "descend" then
+		-- TASK 3: descend to the landing altitude, staying aligned
+		local altErr = CFG.descendTo - height
+		local pitch = (altErr * CFG.pGain) - (sink * CFG.dampSign * CFG.dGain)
+		local pitchCmd = clamp(pitch, -1, 1) * (CFG.maxPitch * 0.5) * CFG.pitchSign
+		local rollCmd  = updateBank(bearing, dt) * CFG.rollSign
+		local tLy = clamp(pitchCmd + rollCmd, -CFG.maxPitch, CFG.maxPitch)
+		local tRy = clamp(pitchCmd - rollCmd, -CFG.maxPitch, CFG.maxPitch)
+		lY  = slew(lY,  tLy, dt)
+		rYv = slew(rYv, tRy, dt)
+		if not testMode then
+			parallel.waitForAll(
+				function() L.setVectorY(lY)  L.setThrust(CFG.thrust - 2) end,
+				function() R.setVectorY(rYv) R.setThrust(CFG.thrust - 2) end
+			)
+		end
+		if height <= CFG.flareHeight then
+			phase = "flare"
+			print("phase: flare  (buttering the landing)")
+		end
 
-	-- pitch as a +/-maxPitch power, then apply the sign convention
-	-- pull back to half so we always have room for the roll offset on top
-	local pitchCmd = clamp(pitch, -1, 1) * (CFG.maxPitch * 0.5) * CFG.pitchSign
-	-- ROLL via differential Y ONLY: left thruster pitches up, right pitches down,
-	-- so the plane rolls without ever touching setVectorX.
-	local rollCmd  = updateBank(bearing, dt) * CFG.rollSign
+	elseif phase == "flare" then
+		-- TASK 4: raise the nose to butter the touchdown
+		local fl = clamp((CFG.flareHeight - height) / CFG.flareHeight, 0, 1)
+		local base = CFG.dampSign * fl * CFG.maxPitch
+		lY  = slew(lY,  base, dt)
+		rYv = slew(rYv, base, dt)
+		if not testMode then
+			parallel.waitForAll(
+				function() L.setVectorY(lY)  L.setThrust(CFG.thrust - 3) end,
+				function() R.setVectorY(rYv) R.setThrust(CFG.thrust - 3) end
+			)
+		end
+		if height <= CFG.touchdown then
+			phase = "land"
+			print("phase: land  (touchdown)")
+		end
 
-	-- left and right get opposite roll offsets added to the shared pitch
-	local tLy = pitchCmd + rollCmd
-	local tRy = pitchCmd - rollCmd
-
-	-- hard-clamp both Y channels to +/-maxPitch (never more than 10)
-	tLy = clamp(tLy, -CFG.maxPitch, CFG.maxPitch)
-	tRy = clamp(tRy, -CFG.maxPitch, CFG.maxPitch)
-
-	-- slew so nothing slams to max
-	lY  = slew(lY,  tLy, dt)
-	rYv = slew(rYv, tRy, dt)
-
-	local thrust = cruising and CFG.thrust or (CFG.thrust - 2)
-
-	if testMode then
-		print(string.format("H:%5.1f S:%+5.1f D:%5.1f Bnk:%+4.1f pitchCmd:%+4.1f lY:%+4.1f rY:%+4.1f",
-			height, sink, dist, bankOut, pitchCmd, lY, rYv))
-	else
-		parallel.waitForAll(
-			function() L.setVectorY(lY)  L.setThrust(thrust) end,
-			function() R.setVectorY(rYv) R.setThrust(thrust) end
-		)
+	elseif phase == "land" then
+		-- TASK 5 (done): cut thrust, hold level
+		lY  = slew(lY,  0, dt)
+		rYv = slew(rYv, 0, dt)
+		if not testMode then
+			parallel.waitForAll(
+				function() L.setVectorY(lY)  L.setThrust(0) end,
+				function() R.setVectorY(rYv) R.setThrust(0) end
+			)
+		end
 	end
 	os.sleep(dt)
 end
