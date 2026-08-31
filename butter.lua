@@ -54,6 +54,11 @@ local CFG = {
 	altBand     = 2,   -- blocks of cruise-alt error considered "reached"
 	flareHeight = 10,  -- below this on descent, flare the landing
 	touchdown   = 0.5, -- below this altitude, consider it landed
+
+	-- Safety / evasive (correct attitude if it ever exceeds a limit)
+	maxAttPitch = 12,  -- hard attitude limit (deg) before evasive fires
+	maxAttRoll  = 25,  -- hard attitude limit (deg) before evasive fires
+	recoverGain = 1.0, -- how hard to pull back toward level when evading
 }
 
 -- =========================================================
@@ -141,6 +146,60 @@ while true do
 	local sink    = alt.getVerticalSpeed() or 0
 	local bearing = nav.getBearingRad() or 0
 	local dist    = nav.getDistanceToTarget() or 100
+
+	-- read ACTUAL attitude from the gimbal sensor (self-correcting)
+	local pDeg, rDeg = imu.getAngles()
+	pDeg = pDeg or 0
+	rDeg = rDeg or 0
+	local attitudeOver = false
+
+	-- ============ SAFETY / EVASIVE OVERRIDE ============
+	-- If the plane is pitching up too far, push the nose DOWN hard.
+	-- If it's rolled over, cut thrust and level the wings.
+	-- Uses the same sign conventions as the main loop so the correction
+	-- always opposes whatever the plane is doing wrong.
+	local sPitch = 0   -- safety pitch correction (overrides normal flight)
+	local sRoll  = 0   -- safety roll correction
+	local sCut = false -- if true, drop thrust while recovering
+
+	if pDeg > CFG.maxAttPitch then
+		-- nose too high -> push down
+		sPitch = -CFG.maxPitch * CFG.recoverGain   -- opposes, via pitchSign later... handled below
+		sCut = true
+		attitudeOver = true
+	elseif pDeg < -CFG.maxAttPitch then
+		-- nose too low -> pull up
+		sPitch = CFG.maxPitch * CFG.recoverGain
+		sCut = true
+		attitudeOver = true
+	end
+
+	if math.abs(rDeg) > CFG.maxAttRoll then
+		-- rolled too far -> level the wings
+		sCut = true
+		attitudeOver = true
+		-- pull bank toward 0 (self-correcting: works regardless of roll sign)
+		sRoll = -math.max(-CFG.rollSign, math.min(CFG.rollSign, rDeg)) * 0.5
+	end
+
+	if attitudeOver then
+		-- EVASIVE: ignore normal phase control, force recovery
+		local tLy = clamp(sPitch + sRoll, -CFG.maxPitch, CFG.maxPitch)
+		local tRy = clamp(sPitch - sRoll, -CFG.maxPitch, CFG.maxPitch)
+		lY  = slew(lY,  tLy, dt)
+		rYv = slew(rYv, tRy, dt)
+		local thr = sCut and 2 or CFG.thrust
+		if not testMode then
+			parallel.waitForAll(
+				function() L.setVectorY(lY)  L.setThrust(thr) end,
+				function() R.setVectorY(rYv) R.setThrust(thr) end
+			)
+		end
+		print(string.format("EVASIVE p:%+.1f r:%+.1f -> lY:%+.1f rY:%+.1f thr:%d",
+			pDeg, rDeg, lY, rYv, thr))
+		os.sleep(dt)
+		goto next
+	end
 
 	updateBank(bearing, dt)
 
