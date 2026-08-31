@@ -1,7 +1,10 @@
+
 --[[ 
 	butter.lua  —  Autonomous "butter the landing" navigator
 	=========================================================
 	Target:  Create: Aeronautics plane, driven from a CC:Tweaked computer
+	NOTE: Make sure you've connected the thrusters/sensors with WIRED modems
+	      and right-clicked each modem to activate them first.
 --]]
 
 local CONFIG = {
@@ -19,9 +22,6 @@ local CONFIG = {
 	landGate    = 15,     -- distance (blocks) to target that starts descent
 
 	-- Pitch Control (PID) --------------------------------------------------
-	-- P  = how hard to correct an altitude error (gain per block)
-	-- I  = integrates small errors over time to remove drift
-	-- D  = damps vertical speed so it settles instead of oscillating (kills the wobble)
 	pitchP = 0.06,     -- proportional gain (per block of error)
 	pitchI = 0.002,    -- integral gain (slow drift removal)
 	pitchD = 0.25,     -- derivative gain (damps oscillation - raise if still wobbles)
@@ -40,7 +40,7 @@ local CONFIG = {
 	speedGain   = 0.1,     -- thrust adjustment aggression
 	thrustMin   = 8,       -- lowest cruise thrust (power)
 	thrustMax   = 11,      -- highest cruise thrust (power)  -- keeps it in the 8-11 range you asked for
-	
+
 	-- Landing Flare ---------------------------------------------------------
 	flareHeight = 8,       -- blocks AGL where the auto-flare starts
 	flareMax    = 6,       -- max nose-up pitch (signal points)
@@ -76,7 +76,6 @@ local currentThrust = 0.0
 
 -- PID state for altitude hold
 local altIntegral = 0.0
-local prevAlt = nil      -- previous altitude for computing derivative ourselves
 
 local function updateBank(bearingRad)
 	local target = clamp(bearingRad * CONFIG.turnGain * (180 / math.pi), -CONFIG.maxBankDeg, CONFIG.maxBankDeg)
@@ -106,44 +105,36 @@ while true do
 		activeBank = currentBank
 	end
 
-	-- SPEED CONTROL
+	-- SPEED CONTROL (cruise power 8-11)
 	local speedErr = CONFIG.targetSpeed - currentVel
 	currentThrust = currentThrust + (speedErr * CONFIG.speedGain)
 	currentThrust = clamp(currentThrust, CONFIG.thrustMin, CONFIG.thrustMax)
 
 	-- PITCH / FLARE  (uses a real PID for stable altitude hold)
-	-- pitchCmd is normalized -1..+1 after this block (nose up = +).
 	local flare = 0
 	local pitchCmd = 0
 
 	if cruising then
-		-- ---------- PITCH ALTITUDE HOLD (PID) ----------
-		-- Positive altErr means we need to climb (we're below cruise).
+		-- PITCH ALTITUDE HOLD (PID)
 		local altErr = CONFIG.cruiseAlt - height
 		if math.abs(altErr) <= CONFIG.altBand then
-			altErr = 0                 -- deadband: stop fighting small wobbles
+			altErr = 0
 		end
 
-		-- P-term: proportional to altitude error
 		local p = altErr * CONFIG.pitchP
 
-		-- I-term: integrates persistent error to remove drift (anti-windup capped)
 		altIntegral = altIntegral + altErr
 		altIntegral = clamp(altIntegral, -CONFIG.integralLimit, CONFIG.integralLimit)
 		local i = altIntegral * CONFIG.pitchI
 
-		-- D-term: damps vertical speed so it settles instead of oscillating
-		-- (approximated with the sensor's own vertical speed signal)
 		local d = -sink * CONFIG.pitchD
 
 		pitchCmd = p + i + d
 	else
-		-- ---------- DESCENT + FLARE ----------
 		local altErr = CONFIG.descendTo - height
-		altIntegral = 0  -- reset integral on approach
+		altIntegral = 0
 		pitchCmd = (altErr * CONFIG.pitchP) - (sink * CONFIG.pitchD)
 
-		-- The "butter": as we get low, ease off the descent and pitch nose up.
 		if height <= CONFIG.flareHeight then
 			local hf = 1 - clamp(height / CONFIG.flareHeight, 0, 1)
 			local sf = clamp(-sink / CONFIG.onRails, 0, 1)
@@ -161,12 +152,11 @@ while true do
 	-- MIX SIGNALS
 	local bankSig = (activeBank / CONFIG.maxBankDeg) * CONFIG.deflect
 	local pitchSig = normalizedPitch * CONFIG.deflect
-	
+
 	local lX, lY = -bankSig, pitchSig
 	local rX, rY = bankSig, pitchSig
 
-	-- HARD CAP: clamp every vector signal to +/- maxVecSignal (10 redstone power).
-	-- No matter what the PID asks for, the thruster nozzle can never exceed 10.
+	-- HARD CAP: every vector signal to +/- maxVecSignal (10 redstone power)
 	local vmax = CONFIG.maxVecSignal
 	lX = clamp(lX, -vmax, vmax)
 	lY = clamp(lY, -vmax, vmax)
@@ -179,17 +169,16 @@ while true do
 		print(string.format("V:%.1f B:%.2f D:%.1f H:%.1f Bnk:%.1f Fl:%.2f L:%d R:%d", currentVel, bearingRad, dist, height, activeBank, flare, math.floor(lY), math.floor(rY)))
 	else
 		parallel.waitForAll(
-			function() 
-				leftAct.setVectorX(lX) 
-				leftAct.setVectorY(lY) 
+			function()
+				leftAct.setVectorX(lX)
+				leftAct.setVectorY(lY)
 				leftAct.setThrust(finalThrust)
 			end,
-			function() 
-				rightAct.setVectorX(rX) 
-				rightAct.setVectorY(rY) 
+			function()
+				rightAct.setVectorX(rX)
+				rightAct.setVectorY(rY)
 				rightAct.setThrust(finalThrust)
 			end
 		)
 		sleep(1 / CONFIG.rate)
 	end
-end
