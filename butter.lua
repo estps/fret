@@ -11,7 +11,6 @@
 --]]
 
 local CFG = {
-	-- PERIPHERAL NAMES (from peripheral.getNames())
 	left      = "liquid_vector_thruster_1",
 	right     = "liquid_vector_thruster_2",
 	altitude  = "altitude_sensor_0",
@@ -19,41 +18,27 @@ local CFG = {
 	nav       = "navigation_table_1",
 	velocity  = "velocity_sensor_0",
 
-	-- =================  SIGNS  =================
-	-- Each is 1 or -1. If thrusters push the WRONG way, flip the matching
-	-- sign below to -1. Use `butter check` to find out which is wrong.
-	--   pitchSign: nose UP   when the script says "pitch up"
-	--   rollSign : rolls the right way when banking
-	--   heightSign: +1 if altitude rising = "going up" (leave -1 if reversed)
 	pitchSign  = 1,
 	rollSign   = 1,
 	dampSign   = 1,
 
-	-- =================  TARGETS  =================
 	cruiseAlt   = 60,      -- EDIT: your real cruising altitude (world Y)
 	descendTo   = -58,     -- landing altitude
 	landGate    = 15,      -- distance to target that starts the descent
 
-	-- =================  CONTROL  =================
-	-- Small numbers = gentle. Increase P a little if it flies too sluggishly.
 	pGain    = 0.05,   -- pitch per block of altitude error
 	dGain    = 0.30,   -- damps vertical speed (kills oscillation)
 	deadband = 1.5,    -- ignore altitude errors under this many blocks
 
-	-- =================  LIMITS / PHYSICS  =================
-	maxPitch   = 10,   -- hard ceiling: never command more than 10 (redstone power)
+	maxPitch   = 10,   -- hard ceiling: never command more than 10
 	maxBank    = 25,   -- hard ceiling for roll signal
-	slewRate   = 2.0,  -- how fast a vector may change per second (0.5=very slow,
-	                   --   3=snappy). Raise a LITTLE if too sluggish.
+	slewRate   = 2.0,  -- how fast a vector may change per second
 	thrust     = 9,    -- cruise thrust power (the 8-11 range)
 	rate       = 10,   -- loop rate Hz
 	bearingGain= 1.5,  -- bank demand per radian of heading error
 	speedTarget= 12,   -- cruise speed m/s
 }
 
--- =========================================================
---  peripheral setup
--- =========================================================
 local function find(name)
 	return peripheral.wrap(name) or peripheral.find(name)
 end
@@ -78,7 +63,6 @@ end
 
 local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
 
--- slewed (rate-limited) outputs so nothing ever slams to max
 local lX, lY, rX, rYv = 0, 0, 0, 0
 local function slew(cur, target, dt)
 	local step = CFG.slewRate * dt
@@ -87,7 +71,6 @@ local function slew(cur, target, dt)
 end
 
 local bankOut = 0
-
 local function updateBank(headingRad, dt)
 	local want = clamp(headingRad * CFG.bearingGain * (180 / math.pi), -CFG.maxBank, CFG.maxBank)
 	local step = 20 * dt
@@ -95,9 +78,6 @@ local function updateBank(headingRad, dt)
 	else bankOut = math.max(want, bankOut - step) end
 end
 
--- =========================================================
---  check mode: prove every direction before flying
--- =========================================================
 if arg and arg[1] == "check" then
 	print("CHECK MODE: moving thrusters one at a time.")
 	print("When the RIGHT side lifts (right thruster Y positive), signs are right.")
@@ -112,16 +92,12 @@ if arg and arg[1] == "check" then
 	return
 end
 
--- =========================================================
---  test mode: show values, move nothing
--- =========================================================
 local testMode = (arg and arg[1] == "test")
 
 print("autopilot online. cruiseAlt=" .. CFG.cruiseAlt .. " thrust=" .. CFG.thrust)
 
 local dt = 1 / CFG.rate
 while true do
-	-- read sensors (nil-safe)
 	local height  = alt.getHeight() or 0
 	local sink    = alt.getVerticalSpeed() or 0
 	local bearing = nav.getBearingRad() or 0
@@ -134,28 +110,22 @@ while true do
 
 	updateBank(bearing, dt)
 
-	-- -------- PITCH (altitude hold) --------
 	local targetAlt = cruising and CFG.cruiseAlt or CFG.descendTo
 	local altErr = targetAlt - height
 	if math.abs(altErr) <= CFG.deadband then altErr = 0 end
 
-	-- PD controller: proportional on altitude error + damping on vertical speed
 	local pitch = (altErr * CFG.pGain) - (sink * CFG.dampSign * CFG.dGain)
 
-	-- flare at landing: gently raise the nose as we get low
 	if not cruising and height <= 10 and height > 0 then
 		local flare = clamp((10 - height) / 10, 0, 1)
 		pitch = (pitch * (1 - flare)) + (CFG.dampSign * flare * 0.6)
 	end
 
-	-- pitch as a +/-maxPitch power, then apply the sign convention
 	local pitchCmd = clamp(pitch, -1, 1) * CFG.maxPitch * CFG.pitchSign
-	local bankCmd  = updateBank(bearing, dt) * CFG.rollSign / CFG.maxBank * CFG.maxBank
+	local bankCmd  = updateBank(bearing, dt) * CFG.rollSign
 
-	-- mix into per-thruster vectors (both pitch together, roll differential)
 	local tLx, tLy, tRx, tRy = -bankCmd, pitchCmd, bankCmd, pitchCmd
 
-	-- slewed so nothing slams to max
 	lX  = slew(lX,  tLx, dt)
 	lY  = slew(lY,  tLy, dt)
 	rX  = slew(rX,  tRx, dt)
