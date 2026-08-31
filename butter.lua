@@ -1,184 +1,176 @@
-
---[[ 
-	butter.lua  —  Autonomous "butter the landing" navigator
-	=========================================================
-	Target:  Create: Aeronautics plane, driven from a CC:Tweaked computer
-	NOTE: Make sure you've connected the thrusters/sensors with WIRED modems
-	      and right-clicked each modem to activate them first.
+--[[
+	butter.lua  —  clean, minimal autopilot for a Create: Aeronautics plane
+	============================================================
+	How to use:
+	  1. Connect EVERY thruster + sensor to the computer through
+	     WIRED modems + networking cable, and RIGHT-CLICK each modem.
+	  2. Run `butter check` FIRST  -> it moves each thruster one at a
+	     time so you can confirm every direction is correct.
+	  3. Run `butter test`          -> prints values, moves nothing.
+	  4. Run `butter`               -> full autopilot.
 --]]
 
-local CONFIG = {
-	-- PERIPHERAL NAMES
-	left     = "liquid_vector_thruster_1",
-	right    = "liquid_vector_thruster_2",
+local CFG = {
+	-- PERIPHERAL NAMES (from peripheral.getNames())
+	left      = "liquid_vector_thruster_1",
+	right     = "liquid_vector_thruster_2",
 	altitude  = "altitude_sensor_0",
 	imu       = "gimbal_sensor_1",
 	nav       = "navigation_table_1",
 	velocity  = "velocity_sensor_0",
 
-	-- Navigation -------------------------------------------------------
-	cruiseAlt   = 60,     -- blocks of cruising altitude (world Y) -- EDIT: match your real cruise height
-	descendTo   = -58,    -- target floor altitude
-	landGate    = 15,     -- distance (blocks) to target that starts descent
+	-- =================  SIGNS  =================
+	-- Each is 1 or -1. If thrusters push the WRONG way, flip the matching
+	-- sign below to -1. Use `butter check` to find out which is wrong.
+	--   pitchSign: nose UP   when the script says "pitch up"
+	--   rollSign : rolls the right way when banking
+	--   heightSign: +1 if altitude rising = "going up" (leave -1 if reversed)
+	pitchSign  = 1,
+	rollSign   = 1,
+	dampSign   = 1,
 
-	-- Pitch Control (PID) --------------------------------------------------
-	pitchP = 0.06,     -- proportional gain (per block of error)
-	pitchI = 0.002,    -- integral gain (slow drift removal)
-	pitchD = 0.25,     -- derivative gain (damps oscillation - raise if still wobbles)
-	altBand = 1.5,     -- deadband: ignore altitude error (blocks) below this
-	integralLimit = 2.0,   -- max accumulated integral (avoid windup)
+	-- =================  TARGETS  =================
+	cruiseAlt   = 60,      -- EDIT: your real cruising altitude (world Y)
+	descendTo   = -58,     -- landing altitude
+	landGate    = 15,      -- distance to target that starts the descent
 
-	-- Pitch & Roll Limits ------------------------------------------------
-	maxPitchDeg  = 10,     -- HARD PITCH LIMIT (+/-10 degrees, no more loops)
-	maxBankDeg   = 30,     -- MAX ROLL: prevents rolling over
-	maxVecSignal = 10,     -- HARD CAP: thruster vector X/Y never sends more than +/-10 redstone power
-	turnGain     = 1.8,    -- how aggressively to bank toward the target
-	bankRate     = 60,     -- max bank change speed (degrees/sec)
+	-- =================  CONTROL  =================
+	-- Small numbers = gentle. Increase P a little if it flies too sluggishly.
+	pGain    = 0.05,   -- pitch per block of altitude error
+	dGain    = 0.30,   -- damps vertical speed (kills oscillation)
+	deadband = 1.5,    -- ignore altitude errors under this many blocks
 
-	-- Speed Control ------------------------------------------------------
-	targetSpeed = 12,     -- Target cruise speed in m/s
-	speedGain   = 0.1,     -- thrust adjustment aggression
-	thrustMin   = 8,       -- lowest cruise thrust (power)
-	thrustMax   = 11,      -- highest cruise thrust (power)  -- keeps it in the 8-11 range you asked for
-
-	-- Landing Flare ---------------------------------------------------------
-	flareHeight = 8,       -- blocks AGL where the auto-flare starts
-	flareMax    = 6,       -- max nose-up pitch (signal points)
-	onRails     = 3.5,     -- descent rate (m/s) that triggers stronger flare
-
-	rate = 10,             -- loop rate in Hz
-	neutral = 7,           -- analog signal for nozzle straight (0..15)
-	deflect = 7,           -- max signal deflection from neutral
+	-- =================  LIMITS / PHYSICS  =================
+	maxPitch   = 10,   -- hard ceiling: never command more than 10 (redstone power)
+	maxBank    = 25,   -- hard ceiling for roll signal
+	slewRate   = 2.0,  -- how fast a vector may change per second (0.5=very slow,
+	                   --   3=snappy). Raise a LITTLE if too sluggish.
+	thrust     = 9,    -- cruise thrust power (the 8-11 range)
+	rate       = 10,   -- loop rate Hz
+	bearingGain= 1.5,  -- bank demand per radian of heading error
+	speedTarget= 12,   -- cruise speed m/s
 }
 
-local function findOne(match)
-	if not match then return nil end
-	return peripheral.wrap(match) or peripheral.find(match)
+-- =========================================================
+--  peripheral setup
+-- =========================================================
+local function find(name)
+	return peripheral.wrap(name) or peripheral.find(name)
 end
+local L   = find(CFG.left)
+local R   = find(CFG.right)
+local alt = find(CFG.altitude)
+local imu = find(CFG.imu)
+local nav = find(CFG.nav)
+local vel = find(CFG.velocity)
 
-local leftAct  = findOne(CONFIG.left)
-local rightAct = findOne(CONFIG.right)
-local alt      = findOne(CONFIG.altitude)
-local imu      = findOne(CONFIG.imu)
-local nav      = findOne(CONFIG.nav)
-local vel      = findOne(CONFIG.velocity)
-
-if not (leftAct and rightAct and alt and imu and nav and vel) then
-	error("Missing peripheral! Check names.\n" ..
-		"L: " .. tostring(leftAct) .. " | R: " .. tostring(rightAct) .. "\n" ..
-		"Alt: " .. tostring(alt) .. " | IMU: " .. tostring(imu) .. "\n" ..
-		"Nav: " .. tostring(nav) .. " | Vel: " .. tostring(vel))
+if not (L and R and alt and imu and nav and vel) then
+	local missing = {}
+	if not L then missing[#missing+1]="left thruster" end
+	if not R then missing[#missing+1]="right thruster" end
+	if not alt then missing[#missing+1]="altitude sensor" end
+	if not imu then missing[#missing+1]="gimbal sensor" end
+	if not nav then missing[#missing+1]="navigation table" end
+	if not vel then missing[#missing+1]="velocity sensor" end
+	error("Missing peripherals: " .. table.concat(missing, ", ") ..
+		"\nAre the thrusters/sensors wired to the computer? Did you right-click the modems?")
 end
 
 local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
-local currentBank = 0.0
-local currentThrust = 0.0
 
--- PID state for altitude hold
-local altIntegral = 0.0
-
-local function updateBank(bearingRad)
-	local target = clamp(bearingRad * CONFIG.turnGain * (180 / math.pi), -CONFIG.maxBankDeg, CONFIG.maxBankDeg)
-	local step = CONFIG.bankRate / CONFIG.rate
-	if target > currentBank then currentBank = math.min(target, currentBank + step)
-	else                     currentBank = math.max(target, currentBank - step) end
-	return clamp(currentBank, -CONFIG.maxBankDeg, CONFIG.maxBankDeg)
+-- slewed (rate-limited) outputs so nothing ever slams to max
+local lX, lY, rX, rYv = 0, 0, 0, 0
+local function slew(cur, target, dt)
+	local step = CFG.slewRate * dt
+	if target > cur then return math.min(target, cur + step) end
+	return math.max(target, cur - step)
 end
 
+local bankOut = 0
+
+local function updateBank(headingRad, dt)
+	local want = clamp(headingRad * CFG.bearingGain * (180 / math.pi), -CFG.maxBank, CFG.maxBank)
+	local step = 20 * dt
+	if want > bankOut then bankOut = math.min(want, bankOut + step)
+	else bankOut = math.max(want, bankOut - step) end
+end
+
+-- =========================================================
+--  check mode: prove every direction before flying
+-- =========================================================
+if arg and arg[1] == "check" then
+	print("CHECK MODE: moving thrusters one at a time.")
+	print("When the RIGHT side lifts (right thruster Y positive), signs are right.")
+	local function wait() os.sleep(1.5) end
+	print("1) PITCH UP both (Y +maxPitch) ..."); L.setVectorY(CFG.maxPitch); R.setVectorY(CFG.maxPitch); wait()
+	print("   both nose up? if NOT, flip pitchSign. relaxing."); L.setVectorY(0); R.setVectorY(0); wait()
+	print("2) ROLL: left-down/right-up ..."); L.setVectorX(-CFG.maxBank); R.setVectorX(CFG.maxBank); wait()
+	print("   rolls right? if NOT flip rollSign. relaxing."); L.setVectorX(0); R.setVectorX(0); wait()
+	print("3) THRUST ", CFG.thrust); L.setThrust(CFG.thrust); R.setThrust(CFG.thrust); wait()
+	L.setThrust(0); R.setThrust(0)
+	print("check done. fix the signs in CFG and re-run.")
+	return
+end
+
+-- =========================================================
+--  test mode: show values, move nothing
+-- =========================================================
 local testMode = (arg and arg[1] == "test")
-if testMode then print("TEST MODE: No drive.") end
 
+print("autopilot online. cruiseAlt=" .. CFG.cruiseAlt .. " thrust=" .. CFG.thrust)
+
+local dt = 1 / CFG.rate
 while true do
-	local bearingRad = nav.getBearingRad() or 0
-	local dist       = nav.getDistanceToTarget() or 100
-	local height    = alt.getHeight() or 0
-	local sink      = alt.getVerticalSpeed() or 0
-	local p_raw, r_raw = imu.getAngles()
-	local rollDeg = r_raw or 0
-	local currentVel = vel.getVelocity() or 0
+	-- read sensors (nil-safe)
+	local height  = alt.getHeight() or 0
+	local sink    = alt.getVerticalSpeed() or 0
+	local bearing = nav.getBearingRad() or 0
+	local dist    = nav.getDistanceToTarget() or 100
+	local _, roll = imu.getAngles()
+	roll  = roll or 0
+	local spd = vel.getVelocity() or 0
 
-	local cruising = dist > CONFIG.landGate
-	local activeBank = cruising and updateBank(bearingRad) or updateBank(0)
+	local cruising = dist > CFG.landGate
 
-	if math.abs(rollDeg) > CONFIG.maxBankDeg then
-		currentBank = currentBank * 0.5
-		activeBank = currentBank
+	updateBank(bearing, dt)
+
+	-- -------- PITCH (altitude hold) --------
+	local targetAlt = cruising and CFG.cruiseAlt or CFG.descendTo
+	local altErr = targetAlt - height
+	if math.abs(altErr) <= CFG.deadband then altErr = 0 end
+
+	-- PD controller: proportional on altitude error + damping on vertical speed
+	local pitch = (altErr * CFG.pGain) - (sink * CFG.dampSign * CFG.dGain)
+
+	-- flare at landing: gently raise the nose as we get low
+	if not cruising and height <= 10 and height > 0 then
+		local flare = clamp((10 - height) / 10, 0, 1)
+		pitch = (pitch * (1 - flare)) + (CFG.dampSign * flare * 0.6)
 	end
 
-	-- SPEED CONTROL (cruise power 8-11)
-	local speedErr = CONFIG.targetSpeed - currentVel
-	currentThrust = currentThrust + (speedErr * CONFIG.speedGain)
-	currentThrust = clamp(currentThrust, CONFIG.thrustMin, CONFIG.thrustMax)
+	-- pitch as a +/-maxPitch power, then apply the sign convention
+	local pitchCmd = clamp(pitch, -1, 1) * CFG.maxPitch * CFG.pitchSign
+	local bankCmd  = updateBank(bearing, dt) * CFG.rollSign / CFG.maxBank * CFG.maxBank
 
-	-- PITCH / FLARE  (uses a real PID for stable altitude hold)
-	local flare = 0
-	local pitchCmd = 0
+	-- mix into per-thruster vectors (both pitch together, roll differential)
+	local tLx, tLy, tRx, tRy = -bankCmd, pitchCmd, bankCmd, pitchCmd
 
-	if cruising then
-		-- PITCH ALTITUDE HOLD (PID)
-		local altErr = CONFIG.cruiseAlt - height
-		if math.abs(altErr) <= CONFIG.altBand then
-			altErr = 0
-		end
+	-- slewed so nothing slams to max
+	lX  = slew(lX,  tLx, dt)
+	lY  = slew(lY,  tLy, dt)
+	rX  = slew(rX,  tRx, dt)
+	rYv = slew(rYv, tRy, dt)
 
-		local p = altErr * CONFIG.pitchP
-
-		altIntegral = altIntegral + altErr
-		altIntegral = clamp(altIntegral, -CONFIG.integralLimit, CONFIG.integralLimit)
-		local i = altIntegral * CONFIG.pitchI
-
-		local d = -sink * CONFIG.pitchD
-
-		pitchCmd = p + i + d
-	else
-		local altErr = CONFIG.descendTo - height
-		altIntegral = 0
-		pitchCmd = (altErr * CONFIG.pitchP) - (sink * CONFIG.pitchD)
-
-		if height <= CONFIG.flareHeight then
-			local hf = 1 - clamp(height / CONFIG.flareHeight, 0, 1)
-			local sf = clamp(-sink / CONFIG.onRails, 0, 1)
-			flare = clamp(hf * 0.6 + sf * 0.4, 0, 1)
-			pitchCmd = pitchCmd * (1 - flare) + flare * 0.5
-		end
-	end
-	pitchCmd = clamp(pitchCmd, -1, 1)
-
-	-- PITCH LIMITER (Hard Clamp to CONFIG.maxPitchDeg)
-	local finalPitchDeg = pitchCmd * CONFIG.maxPitchDeg
-	finalPitchDeg = clamp(finalPitchDeg, -CONFIG.maxPitchDeg, CONFIG.maxPitchDeg)
-	local normalizedPitch = finalPitchDeg / CONFIG.maxPitchDeg
-
-	-- MIX SIGNALS
-	local bankSig = (activeBank / CONFIG.maxBankDeg) * CONFIG.deflect
-	local pitchSig = normalizedPitch * CONFIG.deflect
-
-	local lX, lY = -bankSig, pitchSig
-	local rX, rY = bankSig, pitchSig
-
-	-- HARD CAP: every vector signal to +/- maxVecSignal (10 redstone power)
-	local vmax = CONFIG.maxVecSignal
-	lX = clamp(lX, -vmax, vmax)
-	lY = clamp(lY, -vmax, vmax)
-	rX = clamp(rX, -vmax, vmax)
-	rY = clamp(rY, -vmax, vmax)
-
-	local finalThrust = cruising and currentThrust or (currentThrust * (1 - flare))
+	local thrust = cruising and CFG.thrust or (CFG.thrust - 2)
 
 	if testMode then
-		print(string.format("V:%.1f B:%.2f D:%.1f H:%.1f Bnk:%.1f Fl:%.2f L:%d R:%d", currentVel, bearingRad, dist, height, activeBank, flare, math.floor(lY), math.floor(rY)))
+		print(string.format("H:%5.1f S:%+5.1f D:%5.1f Bnk:%+4.1f pitchCmd:%+4.1f lY:%+4.1f rY:%+4.1f",
+			height, sink, dist, bankOut, pitchCmd, lY, rYv))
 	else
 		parallel.waitForAll(
-			function()
-				leftAct.setVectorX(lX)
-				leftAct.setVectorY(lY)
-				leftAct.setThrust(finalThrust)
-			end,
-			function()
-				rightAct.setVectorX(rX)
-				rightAct.setVectorY(rY)
-				rightAct.setThrust(finalThrust)
-			end
+			function() L.setVectorX(lX) L.setVectorY(lY)  L.setThrust(thrust) end,
+			function() R.setVectorX(rX) R.setVectorY(rYv) R.setThrust(thrust) end
 		)
-		sleep(1 / CONFIG.rate)
 	end
+	os.sleep(dt)
+end
