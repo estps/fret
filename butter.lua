@@ -152,6 +152,34 @@ if arg and arg[1] == "check" then
 end
 
 local testMode = (arg and arg[1] == "test")
+
+-- probe mode: dump the exact shape of every sensor return so we stop guessing
+if arg and arg[1] == "probe" then
+	local function dump(name, v)
+		io.write(name .. " = ")
+		if type(v) == "table" then
+			write("{ ")
+			for k, val in pairs(v) do write(tostring(k) .. "=" .. tostring(val) .. " ") end
+			write("}\n")
+		else
+			print(tostring(v))
+		end
+	end
+	dump("height", alt.getHeight())
+	dump("vertSpeed", alt.getVerticalSpeed())
+	dump("bearingRad", nav.getBearingRad())
+	dump("dist", nav.getDistanceToTarget())
+	local a = { imu.getAngles() }
+	dump("angles[1]", a[1])
+	dump("angles[2]", a[2])
+	if type(a[1]) == "table" then
+		dump("angles[1].pitch", a[1].pitch)
+		dump("angles[1].roll", a[1].roll)
+	end
+	dump("vel", vel and vel.getVelocity and vel.getVelocity())
+	return
+end
+
 print("autopilot online. cruiseAlt=" .. CFG.cruiseAlt .. " climbPitch=" .. CFG.climbPitch .. " maxPitch=" .. CFG.maxPitch)
 
 local dt = 1 / CFG.rate
@@ -162,9 +190,13 @@ while true do
 	local sink    = alt.getVerticalSpeed() or 0
 	local bearing = nav.getBearingRad() or 0
 	local dist    = nav.getDistanceToTarget() or 100
-	local pDeg, rDeg = imu.getAngles()
-	pDeg = pDeg or 0
-	rDeg = rDeg or 0
+	local a = { imu.getAngles() }
+	local pDeg = a[1] or a.pitch or a.x or 0
+	local rDeg = a[2] or a.roll or a.z or 0
+	if type(pDeg) == "table" then pDeg = pDeg.pitch or pDeg.x or pDeg[1] or 0 end
+	if type(rDeg) == "table" then rDeg = rDeg.roll or rDeg.z or rDeg[1] or 0 end
+	pDeg = tonumber(pDeg) or 0
+	rDeg = tonumber(rDeg) or 0
 
 	local thrust = CFG.thrust
 
