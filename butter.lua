@@ -31,12 +31,15 @@ local CONFIG = {
 	-- Pitch & Roll Limits ------------------------------------------------
 	maxPitchDeg  = 10,     -- HARD PITCH LIMIT (+/-10 degrees, no more loops)
 	maxBankDeg   = 30,     -- MAX ROLL: prevents rolling over
+	maxVecSignal = 10,     -- HARD CAP: thruster vector X/Y never sends more than +/-10 redstone power
 	turnGain     = 1.8,    -- how aggressively to bank toward the target
 	bankRate     = 60,     -- max bank change speed (degrees/sec)
 
 	-- Speed Control ------------------------------------------------------
 	targetSpeed = 12,     -- Target cruise speed in m/s
 	speedGain   = 0.1,     -- thrust adjustment aggression
+	thrustMin   = 8,       -- lowest cruise thrust (power)
+	thrustMax   = 11,      -- highest cruise thrust (power)  -- keeps it in the 8-11 range you asked for
 	
 	-- Landing Flare ---------------------------------------------------------
 	flareHeight = 8,       -- blocks AGL where the auto-flare starts
@@ -106,7 +109,7 @@ while true do
 	-- SPEED CONTROL
 	local speedErr = CONFIG.targetSpeed - currentVel
 	currentThrust = currentThrust + (speedErr * CONFIG.speedGain)
-	currentThrust = clamp(currentThrust, 0, 15)
+	currentThrust = clamp(currentThrust, CONFIG.thrustMin, CONFIG.thrustMax)
 
 	-- PITCH / FLARE  (uses a real PID for stable altitude hold)
 	-- pitchCmd is normalized -1..+1 after this block (nose up = +).
@@ -161,6 +164,15 @@ while true do
 	
 	local lX, lY = -bankSig, pitchSig
 	local rX, rY = bankSig, pitchSig
+
+	-- HARD CAP: clamp every vector signal to +/- maxVecSignal (10 redstone power).
+	-- No matter what the PID asks for, the thruster nozzle can never exceed 10.
+	local vmax = CONFIG.maxVecSignal
+	lX = clamp(lX, -vmax, vmax)
+	lY = clamp(lY, -vmax, vmax)
+	rX = clamp(rX, -vmax, vmax)
+	rY = clamp(rY, -vmax, vmax)
+
 	local finalThrust = cruising and currentThrust or (currentThrust * (1 - flare))
 
 	if testMode then
